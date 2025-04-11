@@ -455,17 +455,39 @@ end
 # Method to analyze a table and gather statistics
 def analyze_table(table_name, sample_size = nil)
   puts colored_output("Analyzing table: #{table_name}", :cyan, :bold)
+  bar = nil # Initialize bar outside the loop
 
   begin
     # Fetching the table's columns
     columns = ActiveRecord::Base.connection.columns(table_name)
     stats = {}
 
-    # Get total row count for progress bar
+    # Get total row count
     total_count = get_table_count(table_name)
 
-    # Don't use progress bar for empty tables or when sampling
-    use_progress = total_count > 0 && HAS_PROGRESS_BAR && !sample_size && ENV['DISABLE_PROGRESS_BAR'] != '1'
+    # Calculate total steps for the progress bar (rows * columns)
+    # Use 1 if total_count is 0 to avoid division by zero or incorrect progress
+    total_steps = total_count > 0 ? total_count * columns.length : 0
+
+    # Determine if progress bar should be used
+    use_progress = total_steps > 0 && HAS_PROGRESS_BAR && !sample_size && ENV['DISABLE_PROGRESS_BAR'] != '1'
+
+    # Disable progress bar globally if we've had issues with it
+    if ENV['DISABLE_PROGRESS_BAR'] == '1'
+      puts colored_output("Progress bar disabled via environment variable", :yellow) if $debug
+      use_progress = false
+    end
+
+    # Initialize the progress bar for the whole table if applicable
+    if use_progress
+      begin
+        bar = ProgressBar.new(total_steps)
+      rescue => e
+        puts colored_output("Warning: Could not initialize progress bar for #{table_name}: #{e.message}", :yellow)
+        use_progress = false # Disable progress if init fails
+        ENV['DISABLE_PROGRESS_BAR'] = '1' # Disable for subsequent tables
+      end
+    end
 
     columns.each do |column|
       column_name = column.name
@@ -473,6 +495,7 @@ def analyze_table(table_name, sample_size = nil)
       quoted_column = quote_identifier(column_name)
       quoted_table = quote_identifier(table_name)
 
+      # Display column info if progress bar is not used
       puts "  - Column: #{column_name} (#{column_type})" if !use_progress
 
       # Initialize statistics based on column type
@@ -484,7 +507,7 @@ def analyze_table(table_name, sample_size = nil)
         count: 0,
         null_count: 0,
         frequent_values: Hash.new(0),
-        total_length: 0  # Initialize total_length to 0
+        total_length: 0
       }
 
       # Add type-specific initial stats
@@ -499,42 +522,52 @@ def analyze_table(table_name, sample_size = nil)
 
       # Query to fetch data from the column, with optional sampling
       query = if sample_size && ActiveRecord::Base.connection.adapter_name.downcase.include?('postgres')
-        "SELECT #{quoted_column} FROM #{quoted_table} TABLESAMPLE BERNOULLI(#{sample_size})"
+        # Use SYSTEM sampling for speed, BERNOULLI for better randomness if needed
+        # Note: Percentage is 0-100 for TABLESAMPLE
+        sample_percentage = (sample_size.to_f / total_count * 100).clamp(0.1, 100) if total_count > 0 && sample_size > 0
+        sample_clause = sample_percentage ? "TABLESAMPLE SYSTEM(#{sample_percentage})" : "LIMIT 0" # Use LIMIT 0 if no sample needed
+        "SELECT #{quoted_column} FROM #{quoted_table} #{sample_clause}"
       elsif sample_size
-        "SELECT #{quoted_column} FROM #{quoted_table} ORDER BY RANDOM() LIMIT #{sample_size}"
+        # Fallback for non-PostgreSQL or if TABLESAMPLE fails
+        limit_clause = sample_size > 0 ? "ORDER BY RANDOM() LIMIT #{sample_size}" : "LIMIT 0"
+        "SELECT #{quoted_column} FROM #{quoted_table} #{limit_clause}"
       else
         "SELECT #{quoted_column} FROM #{quoted_table}"
       end
 
-      # Use connection.exec_query instead of select_all for better memory management
+      # Use connection.exec_query for memory efficiency
       result = nil
       begin
         result = ActiveRecord::Base.connection.exec_query(query)
+      rescue ArgumentError => e
+        # Catch potential errors from invalid sample percentage
+        puts colored_output("  Warning: Could not execute query for #{column_name} (sampling issue?): #{e.message}", :yellow)
+        next # Skip this column
       rescue => e
-        if e.message.include?('column reference') && e.message.include?('TABLESAMPLE')
-          # Fall back to regular sampling for older PostgreSQL versions
-          puts colored_output("  TABLESAMPLE not supported, falling back to LIMIT", :yellow)
-          query = "SELECT #{quoted_column} FROM #{quoted_table} ORDER BY RANDOM() LIMIT #{sample_size}"
+        if sample_size && e.message.include?('TABLESAMPLE') && (e.message.include?('syntax error') || e.message.include?('unrecognized sampling method'))
+          puts colored_output("  TABLESAMPLE SYSTEM not supported for #{table_name}, trying BERNOULLI...", :yellow)
+          begin
+            sample_clause = sample_percentage ? "TABLESAMPLE BERNOULLI(#{sample_percentage})" : "LIMIT 0"
+            query = "SELECT #{quoted_column} FROM #{quoted_table} #{sample_clause}"
+            result = ActiveRecord::Base.connection.exec_query(query)
+          rescue => e2
+            puts colored_output("  TABLESAMPLE BERNOULLI failed for #{table_name}, falling back to LIMIT: #{e2.message}", :yellow)
+            limit_clause = sample_size > 0 ? "ORDER BY RANDOM() LIMIT #{sample_size}" : "LIMIT 0"
+            query = "SELECT #{quoted_column} FROM #{quoted_table} #{limit_clause}"
+            result = ActiveRecord::Base.connection.exec_query(query)
+          end
+        elsif sample_size && e.message.include?('ORDER BY RANDOM()') && e.message.include?('performance')
+          puts colored_output("  Warning: ORDER BY RANDOM() can be slow on large tables like #{table_name}. Consider TABLESAMPLE for PostgreSQL.", :yellow)
           result = ActiveRecord::Base.connection.exec_query(query)
         else
+          # Re-raise other errors
           raise e
         end
       end
 
-      # Setup progress bar
-      bar = nil
-      if use_progress
-        bar_title = "Analyzing #{column_name}"
-        begin
-          bar = ProgressBar.new(result.rows.count, :bar, bar_title)
-        rescue => e
-          puts colored_output("Warning: Could not initialize progress bar: #{e.message}", :yellow)
-          use_progress = false
-        end
-      end
-
-      result.rows.each_with_index do |row, idx|
-        value = row[0]  # exec_query returns an array of arrays
+      # Process rows for the current column
+      (result&.rows || []).each do |row|
+        value = row[0]
 
         # Count nulls
         if value.nil?
@@ -545,14 +578,14 @@ def analyze_table(table_name, sample_size = nil)
           stats[column_name][:frequent_values][value_key] += 1
         end
 
-        # Update progress bar
+        # Increment the overall progress bar for the table using increment!
         bar.increment! if use_progress && bar
       end
 
       # Clear the result to free memory
       result = nil
 
-      # Finalize statistics calculations
+      # Finalize statistics calculations for the current column
       finalize_column_stats(stats, column_name, column_type)
 
       # Sort frequent values and extract most/least frequent
@@ -560,18 +593,28 @@ def analyze_table(table_name, sample_size = nil)
       stats[column_name][:most_frequent] = sorted_values.first(5).to_h
       stats[column_name][:least_frequent] = sorted_values.last(5).to_h
 
-      # Remove the full frequent_values hash to reduce memory usage
+      # Remove the full frequent_values hash
       stats[column_name].delete(:frequent_values)
 
-      # Periodically clear active connections to prevent pool exhaustion
+      # Periodically clear active connections
       begin
         ActiveRecord::Base.clear_active_connections! if ActiveRecord::Base.respond_to?(:clear_active_connections!)
       rescue => e
         puts colored_output("Warning: Could not clear active connections: #{e.message}", :yellow) if $debug
       end
-    end
+    end # end columns.each
+
+    # Finish the progress bar after all columns are processed
+    bar.finish if use_progress && bar
+
   rescue => e
+    # Ensure progress bar is finished even on error
+    bar.finish if defined?(bar) && bar
     puts colored_output("Error analyzing table #{table_name}: #{e.message}", :red)
+    if $debug
+      puts colored_output("Backtrace:", :red)
+      puts e.backtrace.join("\n")
+    end
     return { error: e.message }
   end
 

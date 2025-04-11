@@ -20,9 +20,8 @@ module DbReport
       def initialize(db_connection, options)
         @db = db_connection
         @options = options
-        @debug = options[:debug] # Ensure debug flag is accessible
+        @debug = options[:debug]
         # Make $debug accessible globally for Utils module print_debug
-        # This is a compromise; ideally, debug state would be passed explicitly.
         $debug = @debug
       end
 
@@ -52,11 +51,14 @@ module DbReport
           # --- Aggregation --- #
           all_select_parts = [Sequel.function(:COUNT, Sequel.lit('*')).as(:_total_count)]
           initial_col_stats = initialize_column_stats(columns_schema, unique_single_columns)
+
+          # Build all aggregate queries in one pass
           columns_schema.each do |col_sym, col_info|
-            col_select_parts = build_aggregate_select_parts(col_info[:type], col_sym, adapter_type, initial_col_stats[col_sym][:is_unique])
-            all_select_parts.concat(col_select_parts)
+            is_unique = initial_col_stats[col_sym][:is_unique]
+            all_select_parts.concat(build_aggregate_select_parts(col_info[:type], col_sym, adapter_type, is_unique))
           end
 
+          # Execute a single aggregate query for all columns
           all_agg_results = execute_aggregate_query(base_dataset, all_select_parts)
           total_count = all_agg_results ? all_agg_results[:_total_count].to_i : 0
 
@@ -65,7 +67,7 @@ module DbReport
             col_stats = initial_col_stats[column_sym]
             print_info "  - Analyzing column: #{column_sym} (#{col_stats[:type]}/#{col_stats[:db_type]})#{col_stats[:is_unique] ? ' (unique)' : ''}", :white
 
-            col_stats[:count] = total_count # Set total count for this column
+            col_stats[:count] = total_count
             populate_stats_from_aggregates(col_stats, all_agg_results, column_info[:type], column_sym, total_count) if all_agg_results
           end
 
@@ -80,13 +82,13 @@ module DbReport
           end
 
           # Clean up and store final stats
-          columns_schema.each do |column_sym, _column_info|
+          columns_schema.each do |column_sym, _|
             col_stats = initial_col_stats[column_sym]
-            col_stats.delete_if { |_key, value| value.nil? || value == {} } # Clean up empty stats
-            table_stats[column_sym.to_s] = col_stats # Store final stats with string key
+            col_stats.delete_if { |_key, value| value.nil? || value == {} }
+            table_stats[column_sym.to_s] = col_stats
           end
 
-        rescue Sequel::DatabaseError => e # Catch errors like table not found
+        rescue Sequel::DatabaseError => e
           msg = "Schema/Table Error for '#{table_name_string}': #{e.message.lines.first.strip}"
           puts colored_output(msg, :red)
           return { error: msg }
@@ -102,194 +104,203 @@ module DbReport
 
       # Search for a specific value in a given table and its columns
       # Using optimized search with UNIONs for compatible column types
-      # @param table_name [String] Name of the table to search in
-      # @param columns_schema [Hash] Schema information about columns
-      # @param search_value [String] Value to search for
-      # @param col_stats [Hash] Column statistics to update with search results
       def search_for_value_in_table(table_name, columns_schema, search_value, col_stats)
         table_identifier = create_sequel_identifier(table_name)
+        is_postgres = db.database_type == :postgres
 
-        # Group columns by type for UNION-compatible batch processing
-        textual_columns = []
-        uuid_columns = []
-        array_columns = []
-        json_columns = []
-        special_columns = [] # For types requiring special handling
+        # Separate columns that need individual handling from those that can use UNION
+        union_compatible_columns = []
+        special_columns = []
 
         # Categorize columns by search compatibility
         columns_schema.each do |column_sym, column_info|
           case column_info[:type]
-          when :string, :text, :char, :varchar, :inet, nil
-            textual_columns << { column_sym: column_sym, column_info: column_info }
-          when :uuid
-            uuid_columns << { column_sym: column_sym, column_info: column_info }
-          when :array
-            array_columns << { column_sym: column_sym, column_info: column_info }
-          when :json, :jsonb
-            json_columns << { column_sym: column_sym, column_info: column_info }
-          else
+          when :integer, :bigint, :float, :decimal, :numeric, :boolean, :date, :datetime, :timestamp
+            # These types need specialized handling
             special_columns << { column_sym: column_sym, column_info: column_info }
+          else
+            # All other types can potentially use a text-based search with UNION
+            union_compatible_columns << { column_sym: column_sym, column_info: column_info }
           end
         end
 
-        # Perform optimized batch searches
-        if db.database_type == :postgres
-          # PostgreSQL supports better optimizations
-          batch_search_text_columns(table_identifier, textual_columns, search_value, col_stats) if textual_columns.any?
-          batch_search_uuid_columns(table_identifier, uuid_columns, search_value, col_stats) if uuid_columns.any?
-          batch_search_array_columns(table_identifier, array_columns, search_value, col_stats) if array_columns.any?
-          batch_search_json_columns(table_identifier, json_columns, search_value, col_stats) if json_columns.any?
-        else
-          # For other DB types, combine text columns but handle others individually
-          batch_search_text_columns(table_identifier, textual_columns, search_value, col_stats) if textual_columns.any?
+        # Process all union-compatible columns in a single batch
+        search_all_compatible_columns(table_identifier, union_compatible_columns, search_value, col_stats) if union_compatible_columns.any?
 
-          # Handle UUID, arrays, and JSON individually for non-Postgres
-          (uuid_columns + array_columns + json_columns).each do |col_data|
-            search_individual_column(table_identifier, col_data[:column_sym], col_data[:column_info], search_value, col_stats)
-          end
-        end
-
-        # Always process special columns individually
+        # Process special columns individually
         special_columns.each do |col_data|
           search_individual_column(table_identifier, col_data[:column_sym], col_data[:column_info], search_value, col_stats)
         end
       end
 
-      # Batch search textual columns with UNION for better performance
-      def batch_search_text_columns(table_identifier, text_columns, search_value, col_stats)
-        return if text_columns.empty?
+      # Search all compatible columns with a single UNION query
+      def search_all_compatible_columns(table_identifier, columns, search_value, col_stats)
+        return if columns.empty?
 
         begin
-          # Build a single query with multiple UNION subqueries for all text columns
           query_parts = []
+          is_postgres = db.database_type == :postgres
 
-          text_columns.each do |col_data|
+          columns.each do |col_data|
             column_sym = col_data[:column_sym]
-            query_parts << "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)} ILIKE #{db.literal("%#{search_value}%")}"
+            column_info = col_data[:column_info]
+
+            # Build appropriate query part based on column type
+            query_part = case column_info[:type]
+            when :array
+              if is_postgres
+                "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE EXISTS (SELECT 1 FROM unnest(#{db.literal(column_sym)}) AS elem WHERE elem::text ILIKE #{db.literal("%#{search_value}%")})"
+              else
+                "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)}::text ILIKE #{db.literal("%#{search_value}%")}"
+              end
+            when :string, :text, :char, :varchar, :inet, :uuid, :json, :jsonb, :enum, nil
+              build_text_search_query(table_identifier, column_sym, column_info, search_value)
+            else
+              # For any other types, use a text cast in Postgres or LIKE for other DBs
+              if is_postgres
+                "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)}::text ILIKE #{db.literal("%#{search_value}%")}"
+              else
+                "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)} LIKE #{db.literal("%#{search_value}%")}"
+              end
+            end
+
+            print_debug "    Search for '#{column_sym}' (#{column_info[:type]}): #{query_part}" if debug
+            query_parts << query_part
           end
 
-          # Execute the combined query if there are columns to search
+          # Execute the combined query
           unless query_parts.empty?
             combined_query = query_parts.join(" UNION ALL ")
+            print_debug "    Executing combined query for all text-compatible columns (#{query_parts.size} columns)" if debug
+            print_debug "    Query: #{combined_query}" if debug
             results = db.fetch(combined_query).all
 
-            # Process the results
+            # Process results
             results.each do |row|
               if row[:found]
-                col_sym = row[:col_name].to_sym
-                col_stats[col_sym][:found] = true
-                col_stats[col_sym][:search_value] = search_value
-                print_info "    Found '#{search_value}' in column: #{col_sym}", :green
+                column_name = row[:col_name].to_sym
+                col_stats[column_name][:found] = true
+                col_stats[column_name][:search_value] = search_value
+                column_type = columns.find { |c| c[:column_sym] == column_name }&.dig(:column_info, :type)
+                type_display = column_type && column_type != :string && column_type != :text ? " #{column_type}" : ""
+                print_info "    Found '#{search_value}' in#{type_display} column: #{column_name}", :green
               end
             end
           end
         rescue Sequel::DatabaseError => e
-          print_debug "    Error in batch text search: #{e.message}" if debug
+          print_debug "    Error in combined column search: #{e.message}" if debug
+          # Fall back to type-specific searches
+          search_by_column_types(table_identifier, columns, search_value, col_stats)
+        end
+      end
+
+      # Fallback method that searches by column types when combined query fails
+      def search_by_column_types(table_identifier, columns, search_value, col_stats)
+        print_debug "    Falling back to type-specific searches" if debug
+
+        # Group columns by type
+        column_groups = {}
+        columns.each do |col_data|
+          type = col_data[:column_info][:type] || :text
+          column_groups[type] ||= []
+          column_groups[type] << col_data
+        end
+
+        # Search each type group
+        column_groups.each do |type, cols|
+          search_columns_by_type(table_identifier, cols, type, search_value, col_stats)
+        end
+      end
+
+      # Generic method to search columns of a specific type using UNION queries
+      # Used as a fallback when the combined query fails
+      def search_columns_by_type(table_identifier, columns, type, search_value, col_stats)
+        return if columns.empty?
+
+        begin
+          query_parts = []
+          is_postgres = db.database_type == :postgres
+
+          columns.each do |col_data|
+            column_sym = col_data[:column_sym]
+            column_info = col_data[:column_info]
+
+            # Build query part based on column type
+            query_part = case type
+            when :text, :string, :char, :varchar, :inet, nil
+              build_text_search_query(table_identifier, column_sym, column_info, search_value)
+            when :uuid
+              "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)}::text ILIKE #{db.literal("%#{search_value}%")}"
+            when :array
+              if is_postgres
+                "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE EXISTS (SELECT 1 FROM unnest(#{db.literal(column_sym)}) AS elem WHERE elem::text ILIKE #{db.literal("%#{search_value}%")})"
+              else
+                "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)}::text ILIKE #{db.literal("%#{search_value}%")}"
+              end
+            when :json, :jsonb, :enum
+              "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)}::text ILIKE #{db.literal("%#{search_value}%")}"
+            end
+
+            print_debug "    #{type.to_s.upcase} search for '#{column_sym}': #{query_part}" if debug
+            query_parts << query_part
+          end
+
+          # Execute the combined query
+          unless query_parts.empty?
+            combined_query = query_parts.join(" UNION ALL ")
+            print_debug "    Executing combined query for #{type} columns: #{combined_query}" if debug
+            results = db.fetch(combined_query).all
+
+            # Process results
+            process_search_results(results, col_stats, search_value, type)
+          end
+        rescue Sequel::DatabaseError => e
+          print_debug "    Error in batch #{type} search: #{e.message}" if debug
           # Fall back to individual searches
-          text_columns.each do |col_data|
+          columns.each do |col_data|
             search_individual_column(table_identifier, col_data[:column_sym], col_data[:column_info], search_value, col_stats)
           end
         end
       end
 
-      # Batch search UUID columns with UNION for better performance
-      def batch_search_uuid_columns(table_identifier, uuid_columns, search_value, col_stats)
-        return if uuid_columns.empty?
+      # Build specialized text column search query
+      def build_text_search_query(table_identifier, column_sym, column_info, search_value)
+        db_type = column_info[:db_type].to_s.downcase
+        column_name = column_sym.to_s.downcase
+        needs_cast = false
 
-        begin
-          query_parts = []
+        # Determine if we need to cast for PostgreSQL
+        if db.database_type == :postgres
+          needs_cast = column_name == 'event' ||
+                      column_name == 'audit_tg_op' ||
+                      (db_type != 'character varying' &&
+                       db_type != 'varchar' &&
+                       db_type != 'text' &&
+                       db_type != 'char' &&
+                       db_type != 'character' &&
+                       !db_type.start_with?('varchar(') &&
+                       !db_type.start_with?('character varying(') &&
+                       !db_type.start_with?('char(') &&
+                       !db_type.start_with?('character('))
+        end
 
-          uuid_columns.each do |col_data|
-            column_sym = col_data[:column_sym]
-            query_parts << "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)}::text ILIKE #{db.literal("%#{search_value}%")}"
-          end
-
-          unless query_parts.empty?
-            combined_query = query_parts.join(" UNION ALL ")
-            results = db.fetch(combined_query).all
-
-            results.each do |row|
-              if row[:found]
-                col_sym = row[:col_name].to_sym
-                col_stats[col_sym][:found] = true
-                col_stats[col_sym][:search_value] = search_value
-                print_info "    Found '#{search_value}' in UUID column: #{col_sym}", :green
-              end
-            end
-          end
-        rescue Sequel::DatabaseError => e
-          print_debug "    Error in batch UUID search: #{e.message}" if debug
-          # Fall back to individual searches
-          uuid_columns.each do |col_data|
-            search_individual_column(table_identifier, col_data[:column_sym], col_data[:column_info], search_value, col_stats)
-          end
+        if needs_cast
+          "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)}::text ILIKE #{db.literal("%#{search_value}%")}"
+        else
+          "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)} ILIKE #{db.literal("%#{search_value}%")}"
         end
       end
 
-      # Batch search array columns with UNION for better performance
-      def batch_search_array_columns(table_identifier, array_columns, search_value, col_stats)
-        return if array_columns.empty?
+      # Process search results and update column stats
+      def process_search_results(results, col_stats, search_value, type)
+        results.each do |row|
+          if row[:found]
+            column_name = row[:col_name].to_sym
+            col_stats[column_name][:found] = true
+            col_stats[column_name][:search_value] = search_value
 
-        begin
-          query_parts = []
-
-          array_columns.each do |col_data|
-            column_sym = col_data[:column_sym]
-            query_parts << "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE EXISTS (SELECT 1 FROM unnest(#{db.literal(column_sym)}) AS elem WHERE elem::text ILIKE #{db.literal("%#{search_value}%")})"
-          end
-
-          unless query_parts.empty?
-            combined_query = query_parts.join(" UNION ALL ")
-            results = db.fetch(combined_query).all
-
-            results.each do |row|
-              if row[:found]
-                col_sym = row[:col_name].to_sym
-                col_stats[col_sym][:found] = true
-                col_stats[col_sym][:search_value] = search_value
-                print_info "    Found '#{search_value}' in array column: #{col_sym}", :green
-              end
-            end
-          end
-        rescue Sequel::DatabaseError => e
-          print_debug "    Error in batch array search: #{e.message}" if debug
-          # Fall back to individual searches
-          array_columns.each do |col_data|
-            search_individual_column(table_identifier, col_data[:column_sym], col_data[:column_info], search_value, col_stats)
-          end
-        end
-      end
-
-      # Batch search JSON columns with UNION for better performance
-      def batch_search_json_columns(table_identifier, json_columns, search_value, col_stats)
-        return if json_columns.empty?
-
-        begin
-          query_parts = []
-
-          json_columns.each do |col_data|
-            column_sym = col_data[:column_sym]
-            query_parts << "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)}::text ILIKE #{db.literal("%#{search_value}%")}"
-          end
-
-          unless query_parts.empty?
-            combined_query = query_parts.join(" UNION ALL ")
-            results = db.fetch(combined_query).all
-
-            results.each do |row|
-              if row[:found]
-                col_sym = row[:col_name].to_sym
-                col_stats[col_sym][:found] = true
-                col_stats[col_sym][:search_value] = search_value
-                print_info "    Found '#{search_value}' in JSON column: #{col_sym}", :green
-              end
-            end
-          end
-        rescue Sequel::DatabaseError => e
-          print_debug "    Error in batch JSON search: #{e.message}" if debug
-          # Fall back to individual searches
-          json_columns.each do |col_data|
-            search_individual_column(table_identifier, col_data[:column_sym], col_data[:column_info], search_value, col_stats)
+            type_display = type == :text ? "" : " #{type}"
+            print_info "    Found '#{search_value}' in#{type_display} column: #{column_name}", :green
           end
         end
       end
@@ -299,68 +310,68 @@ module DbReport
         begin
           # Create a safe query to search for the value
           dataset = db[table_identifier]
+          result = false
+          query_used = nil
 
           # Different search strategies based on column type
           case column_info[:type]
           when :integer, :bigint
-            # Try to convert value to integer if the column type is integer
             begin
               int_value = Integer(search_value)
+              query_used = "#{db.literal(column_sym)} = #{int_value}"
+              print_debug "    NUMERIC search in '#{column_sym}': WHERE #{query_used}" if debug
               result = dataset.where(column_sym => int_value).count > 0
             rescue ArgumentError
-              # If search_value can't be converted to integer, no match
               result = false
             end
           when :float, :decimal, :numeric
-            # Try to convert value to float if the column type is float/decimal
             begin
               float_value = Float(search_value)
+              query_used = "#{db.literal(column_sym)} = #{float_value}"
+              print_debug "    NUMERIC search in '#{column_sym}': WHERE #{query_used}" if debug
               result = dataset.where(column_sym => float_value).count > 0
             rescue ArgumentError
               result = false
             end
           when :boolean
-            # Handle boolean values
             bool_value = case search_value.downcase
-                        when 'true', 't', 'yes', 'y', '1'
-                          true
-                        when 'false', 'f', 'no', 'n', '0'
-                          false
-                        else
-                          nil
+                        when 'true', 't', 'yes', 'y', '1' then true
+                        when 'false', 'f', 'no', 'n', '0' then false
                         end
-            result = !bool_value.nil? && dataset.where(column_sym => bool_value).count > 0
+            if !bool_value.nil?
+              query_used = "#{db.literal(column_sym)} = #{bool_value}"
+              print_debug "    BOOLEAN search in '#{column_sym}': WHERE #{query_used}" if debug
+              result = dataset.where(column_sym => bool_value).count > 0
+            end
           when :date, :datetime, :timestamp
             # Skip date/time types for simple string searches
+            print_debug "    Skipping DATE/TIME search in '#{column_sym}'" if debug
             result = false
-          when :uuid
-            # For UUID columns, cast to text for string-based search
-            if db.database_type == :postgres
-              result = dataset.where(Sequel.lit("#{db.literal(column_sym)}::text ILIKE ?", "%#{search_value}%")).count > 0
-            else
-              # Fallback to string representation for other databases
-              result = dataset.where(Sequel.like(Sequel.function(:cast, column_sym, :text), "%#{search_value}%")).count > 0
-            end
-          when :array
-            # For array columns, use PostgreSQL array-specific functions
-            if db.database_type == :postgres
-              # Use unnest to convert array to rows for text search
-              result = dataset.where(Sequel.lit("EXISTS (SELECT 1 FROM unnest(#{db.literal(column_sym)}) AS elem WHERE elem::text ILIKE ?)", "%#{search_value}%")).count > 0
-            else
-              # Fallback to string representation for other databases
-              result = dataset.where(Sequel.like(Sequel.function(:cast, column_sym, :text), "%#{search_value}%")).count > 0
-            end
-          when :json, :jsonb
-            # For JSON types, use database-specific containment operators
-            if db.database_type == :postgres
-              result = dataset.where(Sequel.lit("#{db.literal(column_sym)}::text ILIKE ?", "%#{search_value}%")).count > 0
-            else
-              # Fallback for other databases
-              result = dataset.where(Sequel.like(Sequel.function(:cast, column_sym, :text), "%#{search_value}%")).count > 0
-            end
           else
-            # Default string-based search for other types
-            result = dataset.where(Sequel.like(column_sym, "%#{search_value}%")).count > 0
+            # Handle special cases for string searching
+            is_postgres = db.database_type == :postgres
+            db_type = column_info[:db_type].to_s.downcase
+            column_name = column_sym.to_s.downcase
+
+            # Handle special PostgreSQL types
+            if is_postgres && (column_name == 'event' || column_name == 'audit_tg_op' ||
+               !['character varying', 'varchar', 'text', 'char', 'character'].include?(db_type))
+              begin
+                query_used = "#{db.literal(column_sym)}::text ILIKE '%#{search_value}%'"
+                print_debug "    TEXT search with cast in '#{column_sym}': WHERE #{query_used}" if debug
+                result = dataset.where(Sequel.lit("#{db.literal(column_sym)}::text ILIKE ?", "%#{search_value}%")).count > 0
+              rescue Sequel::DatabaseError => e
+                print_debug "    Error searching custom type column with cast: #{e.message}" if debug
+                query_used = "#{db.literal(column_sym)} LIKE '%#{search_value}%'"
+                print_debug "    Fallback TEXT search in '#{column_sym}': WHERE #{query_used}" if debug
+                result = dataset.where(Sequel.like(column_sym, "%#{search_value}%")).count > 0
+              end
+            else
+              # Default string-based search for other types
+              query_used = "#{db.literal(column_sym)} LIKE '%#{search_value}%'"
+              print_debug "    TEXT search in '#{column_sym}': WHERE #{query_used}" if debug
+              result = dataset.where(Sequel.like(column_sym, "%#{search_value}%")).count > 0
+            end
           end
 
           # Add search result to column stats
@@ -375,25 +386,19 @@ module DbReport
       end
 
       # Analyze tables in parallel using multiple processes (default method)
-      # @param tables_to_analyze [Array<String>] List of table names to analyze
-      # @param parallel_processes [Integer] Number of parallel processes to use (defaults to processor count)
-      # @return [Hash] Combined results of table analysis
       def analyze_tables_in_parallel(tables_to_analyze = nil, parallel_processes = nil)
         begin
           require 'parallel'
         rescue LoadError
           print_warning "The 'parallel' gem is required for parallel analysis but was not found."
-          print_warning "Run 'gem install parallel' to install it, or add it to your Gemfile."
           print_warning "Falling back to sequential analysis."
           return analyze_tables_sequentially(tables_to_analyze)
         end
 
         tables_to_analyze ||= select_tables_to_analyze
-        # Determine number of workers - use specified value or auto-detect, but never more than table count
+        # Determine optimal number of workers
         default_processes = [Parallel.processor_count, tables_to_analyze.size].min
         parallel_processes ||= options[:parallel_processes] || default_processes
-
-        # Further limit processes to table count if needed
         parallel_processes = [parallel_processes, tables_to_analyze.size].min
 
         print_info "Using #{parallel_processes} parallel processes to analyze #{tables_to_analyze.size} tables", :cyan, :bold
@@ -401,8 +406,7 @@ module DbReport
         # Initialize database config for connection recreation in child processes
         db_opts = @db.opts.dup
 
-        # We need to use processes, not threads, for true parallelism
-        # Each process will create its own database connection
+        # Run analysis in parallel using processes
         results = Parallel.map(tables_to_analyze, in_processes: parallel_processes) do |table_name|
           # Create a new database connection for each process
           process_db = Sequel.connect(db_opts)
@@ -422,18 +426,12 @@ module DbReport
         Hash[results]
       end
 
-      # Analyze tables sequentially (fallback method when parallel gem is unavailable)
-      # @param tables_to_analyze [Array<String>] List of table names to analyze
-      # @return [Hash] Combined results of table analysis
+      # Analyze tables sequentially
       def analyze_tables_sequentially(tables_to_analyze = nil)
         tables_to_analyze ||= select_tables_to_analyze
-        results = {}
-
-        tables_to_analyze.each do |table_name|
+        tables_to_analyze.each_with_object({}) do |table_name, results|
           results[table_name] = analyze_table(table_name)
         end
-
-        results
       end
     end
   end

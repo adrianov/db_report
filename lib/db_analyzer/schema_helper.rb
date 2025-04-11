@@ -30,6 +30,33 @@ module DbReport
               print_debug("    Inferred type :tsvector for column #{col_sym} based on db_type: #{col_info[:db_type]}") if $debug
             end
           end
+
+          # Check for PostgreSQL enum types
+          # PostgreSQL enums are reported as 'user-defined' types
+          if db.database_type == :postgres && col_info[:type] == :string && db_type != 'character varying' &&
+             db_type != 'varchar' && db_type != 'text' && db_type != 'char' && db_type != 'character' &&
+             !db_type.start_with?('varchar(') && !db_type.start_with?('character varying(') &&
+             !db_type.start_with?('char(') && !db_type.start_with?('character(')
+            # Check if this is likely an enum type in PostgreSQL
+            begin
+              # Query to check if the type is an enum
+              is_enum = db.fetch(<<~SQL, db_type).first
+                SELECT EXISTS (
+                  SELECT 1 FROM pg_type t
+                  JOIN pg_enum e ON t.oid = e.enumtypid
+                  WHERE t.typname = ?
+                ) AS is_enum
+              SQL
+
+              if is_enum && is_enum[:is_enum]
+                col_info[:type] = :enum
+                print_debug("    Inferred type :enum for column #{col_sym} based on db_type: #{col_info[:db_type]}") if $debug
+              end
+            rescue Sequel::DatabaseError => e
+              # If the query fails, we'll leave the type as it is
+              print_debug("    Error checking enum type for column #{col_sym}: #{e.message}") if $debug
+            end
+          end
         end
         schema
       end

@@ -185,9 +185,15 @@ Analyzing #{tables_to_analyze.length} table(s): #{tables_to_analyze.join(', ')}"
 
           col_stats[:count] = total_count # Set total count for this column
           populate_stats_from_aggregates(col_stats, all_agg_results, column_info[:type], column_sym, total_count) if all_agg_results
+        end
 
-          analyze_frequency(col_stats, column_sym, base_dataset, column_info[:type], unique_single_columns)
+        # Batch analyze frequencies for all columns in one go
+        print_debug "  Batch analyzing column frequencies..." if debug
+        batch_analyze_frequencies(initial_col_stats, base_dataset, columns_schema, unique_single_columns)
 
+        # Clean up and store final stats
+        columns_schema.each do |column_sym, _column_info|
+          col_stats = initial_col_stats[column_sym]
           col_stats.delete_if { |_key, value| value.nil? || value == {} } # Clean up empty stats
           table_stats[column_sym.to_s] = col_stats # Store final stats with string key
         end
@@ -514,6 +520,264 @@ Analyzing #{tables_to_analyze.length} table(s): #{tables_to_analyze.join(', ')}"
         print_debug("  Frequency Duration: #{duration}s") if debug
       end
       result
+    end
+
+    # Determine if a column needs frequency analysis
+    def needs_frequency_analysis?(col_stats, column_sym, column_type, unique_single_columns, row_count)
+      return false if row_count <= 0 # Skip if table is empty
+
+      is_groupable = !%i[text blob xml array hstore json jsonb].include?(column_type)
+      is_likely_key = col_stats[:is_unique] || unique_single_columns.include?(column_sym) ||
+                      column_sym == :id || column_sym.to_s.end_with?('_id')
+      is_json_type = column_type == :json || column_type == :jsonb
+
+      # Skip if not groupable (unless JSON) or is a likely key (unless JSON)
+      return false unless is_groupable || is_json_type
+      return false if is_likely_key && !is_json_type
+
+      true
+    end
+
+    # Batch analyze frequencies for multiple columns at once
+    def batch_analyze_frequencies(col_stats_map, base_dataset, columns_schema, unique_single_columns)
+      return if columns_schema.empty?
+
+      # Get total row count from first column's stats
+      row_count = col_stats_map.values.first[:count].to_i
+      return if row_count <= 0
+
+      # Identify columns needing frequency analysis and group by type
+      analyzable_columns = {}
+
+      columns_schema.each do |column_sym, column_info|
+        col_stats = col_stats_map[column_sym]
+        column_type = column_info[:type]
+
+        if needs_frequency_analysis?(col_stats, column_sym, column_type, unique_single_columns, row_count)
+          db_type = column_info[:db_type].to_s.downcase
+
+          # Group by actual database type for union compatibility
+          if column_type == :json || column_type == :jsonb
+            # Process JSON columns individually
+            begin
+              analyze_json_frequency(col_stats_map[column_sym], column_sym, base_dataset)
+            rescue => e
+              puts colored_output("  Error analyzing JSON frequency for #{column_sym}: #{e.message}", :red)
+            end
+          else
+            # Group by database type for UNION compatibility
+            type_key = db_type.split('(').first.strip # Extract base type without size/precision
+            analyzable_columns[type_key] ||= []
+            analyzable_columns[type_key] << {sym: column_sym, type: column_type, col_stats: col_stats}
+          end
+        end
+      end
+
+      # Process each type group separately for UNION compatibility
+      analyzable_columns.each do |type_key, columns|
+        print_debug("  Processing batch for type: #{type_key} with #{columns.size} columns") if debug
+
+        # Most frequent values
+        batch_analyze_most_frequent_by_type(columns, base_dataset)
+
+        # Least frequent values where needed
+        least_freq_columns = columns.select do |col_info|
+          distinct_count = col_info[:col_stats][:distinct_count] || 0
+          distinct_count > 5
+        end
+
+        batch_analyze_least_frequent_by_type(least_freq_columns, base_dataset) if least_freq_columns.any?
+
+        # Handle special case for columns with few distinct values
+        few_distinct_columns = columns.select do |col_info|
+          col_stats = col_info[:col_stats]
+          distinct_count = col_stats[:distinct_count] || 0
+          most_freq_empty = col_stats[:most_frequent].nil? || col_stats[:most_frequent].empty?
+          distinct_count > 0 && distinct_count <= 5 && most_freq_empty
+        end
+
+        batch_analyze_all_values_by_type(few_distinct_columns, base_dataset) if few_distinct_columns.any?
+      end
+
+      # Clean up least_frequent that don't need it
+      columns_schema.each do |column_sym, _|
+        col_stats = col_stats_map[column_sym]
+        distinct_count = col_stats[:distinct_count] || 0
+        if distinct_count <= 5 || (col_stats[:least_frequent] && col_stats[:least_frequent].empty?)
+          col_stats.delete(:least_frequent)
+        end
+      end
+    end
+
+    # Batch analyze most frequent values for multiple columns of the same type
+    def batch_analyze_most_frequent_by_type(columns, base_dataset)
+      return if columns.empty?
+
+      column_symbols = columns.map { |c| c[:sym] }
+      print_debug("  Batch analyzing most frequent values for columns: #{column_symbols.join(', ')}") if debug
+
+      # For each column, create a separate query and union them
+      union_datasets = []
+
+      columns.each do |col_info|
+        column_sym = col_info[:sym]
+        # Create a dataset that selects column, count, and a constant 'column_name'
+        column_dataset = base_dataset
+          .select(column_sym,
+                  Sequel.function(:COUNT, Sequel.lit('*')).as(:count),
+                  Sequel.lit("'#{column_sym}'").as(:column_name))
+          .group(column_sym)
+          .order(Sequel.desc(:count), column_sym)
+          .limit(5)
+
+        union_datasets << column_dataset
+      end
+
+      # Combine all queries with UNION ALL
+      combined_dataset = union_datasets.reduce { |combined, dataset| combined.union(dataset, all: true) }
+
+      # Execute the combined query
+      start_time = Time.now
+      begin
+        results = combined_dataset.all
+
+        # Process results
+        results_by_column = {}
+        results.each do |row|
+          column_name = row[:column_name].to_sym
+          results_by_column[column_name] ||= []
+          results_by_column[column_name] << row
+        end
+
+        # Update column stats
+        results_by_column.each do |column_sym, column_results|
+          columns.each do |col_info|
+            if col_info[:sym] == column_sym
+              col_info[:col_stats][:most_frequent] = format_frequency_results(column_results, column_sym)
+              break
+            end
+          end
+        end
+
+      rescue => e
+        puts colored_output("  Error in batch frequency analysis: #{e.message}", :red)
+        print_debug("  Failed SQL: #{combined_dataset.sql}") if debug
+
+        # Fall back to individual queries
+        print_debug("  Falling back to individual frequency queries") if debug
+        columns.each do |col_info|
+          analyze_standard_frequency(col_info[:col_stats], col_info[:sym], base_dataset)
+        end
+      ensure
+        duration = (Time.now - start_time).round(4)
+        print_debug("  Batch frequency analysis duration: #{duration}s") if debug
+      end
+    end
+
+    # Batch analyze least frequent values for multiple columns of the same type
+    def batch_analyze_least_frequent_by_type(columns, base_dataset)
+      return if columns.empty?
+
+      column_symbols = columns.map { |c| c[:sym] }
+      print_debug("  Batch analyzing least frequent values for columns: #{column_symbols.join(', ')}") if debug
+
+      # Similar to batch_analyze_most_frequent but with ascending count order
+      union_datasets = []
+
+      columns.each do |col_info|
+        column_sym = col_info[:sym]
+        column_dataset = base_dataset
+          .select(column_sym,
+                  Sequel.function(:COUNT, Sequel.lit('*')).as(:count),
+                  Sequel.lit("'#{column_sym}'").as(:column_name))
+          .group(column_sym)
+          .order(Sequel.asc(:count), column_sym)
+          .limit(5)
+
+        union_datasets << column_dataset
+      end
+
+      combined_dataset = union_datasets.reduce { |combined, dataset| combined.union(dataset, all: true) }
+
+      start_time = Time.now
+      begin
+        results = combined_dataset.all
+
+        results_by_column = {}
+        results.each do |row|
+          column_name = row[:column_name].to_sym
+          results_by_column[column_name] ||= []
+          results_by_column[column_name] << row
+        end
+
+        results_by_column.each do |column_sym, column_results|
+          columns.each do |col_info|
+            if col_info[:sym] == column_sym
+              col_info[:col_stats][:least_frequent] = format_frequency_results(column_results, column_sym)
+              break
+            end
+          end
+        end
+
+      rescue => e
+        puts colored_output("  Error in batch least frequency analysis: #{e.message}", :red)
+        # Individual fallback handled in outer method
+      ensure
+        duration = (Time.now - start_time).round(4)
+        print_debug("  Batch least frequency analysis duration: #{duration}s") if debug
+      end
+    end
+
+    # Analyze all values for columns with few distinct values
+    def batch_analyze_all_values_by_type(columns, base_dataset)
+      return if columns.empty?
+
+      column_symbols = columns.map { |c| c[:sym] }
+      print_debug("  Analyzing all values for columns with few distinct values: #{column_symbols.join(', ')}") if debug
+
+      union_datasets = []
+
+      columns.each do |col_info|
+        column_sym = col_info[:sym]
+        column_dataset = base_dataset
+          .select(column_sym,
+                  Sequel.function(:COUNT, Sequel.lit('*')).as(:count),
+                  Sequel.lit("'#{column_sym}'").as(:column_name))
+          .group(column_sym)
+          .order(Sequel.asc(:count), column_sym)
+
+        union_datasets << column_dataset
+      end
+
+      combined_dataset = union_datasets.reduce { |combined, dataset| combined.union(dataset, all: true) }
+
+      start_time = Time.now
+      begin
+        results = combined_dataset.all
+
+        results_by_column = {}
+        results.each do |row|
+          column_name = row[:column_name].to_sym
+          results_by_column[column_name] ||= []
+          results_by_column[column_name] << row
+        end
+
+        results_by_column.each do |column_sym, column_results|
+          columns.each do |col_info|
+            if col_info[:sym] == column_sym
+              col_info[:col_stats][:most_frequent] = format_frequency_results(column_results, column_sym)
+              col_info[:col_stats].delete(:least_frequent) # Remove placeholder
+              break
+            end
+          end
+        end
+
+      rescue => e
+        puts colored_output("  Error in batch all values analysis: #{e.message}", :red)
+      ensure
+        duration = (Time.now - start_time).round(4)
+        print_debug("  Batch all values analysis duration: #{duration}s") if debug
+      end
     end
 
   end # class Analyzer

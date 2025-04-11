@@ -566,10 +566,11 @@ def build_aggregate_select_parts(column_type, column_sym, adapter_type, is_uniqu
       print_warning "MIN/MAX on UUID might not be supported for #{adapter_type}" if $debug
     end
   when :boolean
-    # MIN/MAX are useful for booleans
+    # MIN/MAX are useful for booleans, cast to int first for PG compatibility
+    int_cast_expr = Sequel.cast(column_sym, :integer)
     parts += [
-      Sequel.function(:MIN, column_sym).as(min_alias),
-      Sequel.function(:MAX, column_sym).as(max_alias)
+      Sequel.function(:MIN, int_cast_expr).as(min_alias),
+      Sequel.function(:MAX, int_cast_expr).as(max_alias)
     ]
   when :array
     # MIN/MAX for array length
@@ -790,7 +791,10 @@ def analyze_frequency(col_stats, column_sym, base_dataset, column_type, unique_s
     least_freq_order = [Sequel.asc(:count), column_sym] # Original order
 
     most_freq_results = execute_frequency_query(base_dataset, column_sym, most_freq_order, 5)
-    col_stats[:most_frequent] = most_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
+    col_stats[:most_frequent] = most_freq_results.to_h do |row|
+      key = row[column_sym].nil? ? "NULL" : row[column_sym].to_s
+      [key, row[:count].to_i]
+    end
 
     # Least Frequent (only if worthwhile)
     distinct_count = col_stats[:distinct_count] || 0
@@ -798,12 +802,18 @@ def analyze_frequency(col_stats, column_sym, base_dataset, column_type, unique_s
     if distinct_count > 5
       # Pass base_dataset, column, order, and limit
       least_freq_results = execute_frequency_query(base_dataset, column_sym, least_freq_order, 5)
-      col_stats[:least_frequent] = least_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
+      col_stats[:least_frequent] = least_freq_results.to_h do |row|
+        key = row[column_sym].nil? ? "NULL" : row[column_sym].to_s
+        [key, row[:count].to_i]
+      end
     elsif distinct_count > 0 && distinct_count <= 5 && col_stats[:most_frequent].empty?
       # Fetch all distinct values if <= 5 and most_frequent wasn't populated (no limit needed, use least order)
       # Pass nil as limit to fetch all
       all_freq_results = execute_frequency_query(base_dataset, column_sym, least_freq_order, nil)
-      col_stats[:most_frequent] = all_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
+      col_stats[:most_frequent] = all_freq_results.to_h do |row|
+        key = row[column_sym].nil? ? "NULL" : row[column_sym].to_s
+        [key, row[:count].to_i]
+      end
     end
   end
 

@@ -133,6 +133,88 @@ Table: #{table_name}", :cyan, :bold)
       end
     end
 
+    # Print a summary formatted for GPT consumption
+    def print_gpt_summary
+      meta = report_data[:metadata]
+      puts "# Database Analysis Report (GPT Format)"
+      puts
+      puts "- **Adapter:** #{meta[:database_adapter]}"
+      puts "- **Type:** #{meta[:database_type]}"
+      puts "- **Version:** #{meta[:database_version]}"
+      puts "- **Generated:** #{meta[:generated_at]}"
+      puts "- **Duration:** #{meta[:analysis_duration_seconds]}s"
+      puts "- **Tables Analyzed:** #{meta[:analyzed_tables].length}"
+
+      report_data[:tables].each do |table_name, table_data|
+        puts "\n## Table: #{table_name}"
+
+        if table_data.is_a?(Hash) && table_data[:error]
+          puts "  - Error: #{table_data[:error]}"
+          next
+        end
+
+        unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
+          puts "  - Skipping malformed data for table: #{table_name}"
+          next
+        end
+
+        column_count = table_data.keys.length
+        first_col_stats = table_data.values.first || {}
+        row_count = first_col_stats[:count] || 'N/A'
+        puts "\n- **Rows:** #{row_count}"
+        puts "- **Columns:** #{column_count}"
+        puts
+        puts "### Columns Details:"
+
+        table_data.each do |column_name, stats|
+          next unless stats.is_a?(Hash)
+
+          type_part = stats[:type].to_s
+          db_type_part = stats[:db_type].to_s
+          type_str = if type_part.empty? || type_part == db_type_part
+                       db_type_part
+                     else
+                       "#{type_part} / #{db_type_part}"
+                     end
+
+          puts "- **`#{column_name}`**"
+          puts "    - Type: #{type_str}"
+
+          null_count = stats[:null_count].to_i
+          total_count = stats[:count].to_i
+          null_perc_str = if total_count.positive?
+                            "(#{ (null_count.to_f / total_count * 100).round(1) }%)"
+                          else
+                            ''
+                          end
+          puts "    - Nulls: #{null_count} #{null_perc_str}"
+
+          if stats[:distinct_count] && stats[:distinct_count].to_i > 0
+            puts "    - Distinct Values: #{stats[:distinct_count]} #{stats[:is_unique] ? '(Unique)' : ''}"
+          elsif stats[:is_unique]
+             puts "    - Distinct Values: (Unique - count matches rows)"
+          end
+
+          # Add simplified stats based on type (more concise for GPT)
+          formatted = format_stats_for_summary(stats)
+          stat_parts = [] # Collect key stats
+          stat_parts << "Min: #{truncate_value(formatted[:min], 40)}" if formatted.key?(:min)
+          stat_parts << "Max: #{truncate_value(formatted[:max], 40)}" if formatted.key?(:max)
+          stat_parts << "Avg: #{formatted[:average]}" if formatted.key?(:average)
+          stat_parts << "AvgLen: #{formatted[:avg_length]}" if formatted.key?(:avg_length)
+          stat_parts << "AvgItems: #{formatted[:avg_items]}" if formatted.key?(:avg_items)
+          stat_parts << "True%: #{formatted[:true_percentage]}" if formatted.key?(:true_percentage)
+
+          puts "    - Stats: #{stat_parts.join(', ')}" unless stat_parts.empty?
+
+          if formatted[:most_frequent]&.any?
+             top_val, top_count = formatted[:most_frequent].first
+             puts "    - Most Frequent: #{truncate_value(top_val, 40)} (#{top_count})"
+          end
+        end
+      end
+    end
+
     # Write the JSON report to a file or stdout
     def write_json(output_file)
       # Use make_json_safe from Utils module

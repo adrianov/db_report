@@ -253,6 +253,7 @@ Analysis finished in #{duration} seconds.", :green, :bold
     case options[:format]
     when 'summary' then reporter.print_summary
     when 'json' then reporter.write_json(options[:output_file])
+    when 'gpt' then reporter.print_gpt_summary
     # Add other formats here if needed
     end
   end

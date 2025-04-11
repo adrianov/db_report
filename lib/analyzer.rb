@@ -277,7 +277,8 @@ Analyzing #{tables_to_analyze.length} table(s): #{tables_to_analyze.join(', ')}"
       parts = [Sequel.function(:COUNT, column_sym).as(non_null_alias)]
       # Simple heuristic for PK/FK identification
       is_likely_key = is_unique || column_sym == :id || column_sym.to_s.end_with?('_id')
-      groupable = !%i[text blob xml array hstore].include?(column_type)
+      # Add :tsvector to the list of types that don't support standard MIN/MAX
+      groupable = !%i[text blob xml array hstore tsvector].include?(column_type)
 
       # MIN/MAX (handle type specifics)
       min_max_added = false

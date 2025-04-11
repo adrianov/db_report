@@ -54,6 +54,8 @@ module DbReport
         when :tsvector
           # Skip MIN/MAX for tsvector type
           min_max_added = true
+          # Skip all aggregation functions for tsvector
+          return parts
         end
         # Default MIN/MAX for other types if not handled above
         unless min_max_added || !groupable # Don't add MIN/MAX for non-groupable types like text/blob unless handled above
@@ -68,7 +70,10 @@ module DbReport
             parts << Sequel.function(:AVG, Sequel.cast(column_sym, cast_type)).as(avg_alias)
             parts << Sequel.function(:COUNT, Sequel.function(:DISTINCT, column_sym)).as(distinct_count_alias)
           end
-        when :string, :text, :blob, :enum, :inet, :uuid, :json, :jsonb # String-like/complex
+        when :string, :text, :blob, :enum, :inet, :uuid, :json, :jsonb, :tsvector # String-like/complex
+          # Skip tsvector completely
+          return parts if column_type == :tsvector
+
           # Average Length (cast non-strings to text)
           unless is_unique || [:text, :blob].include?(column_type) # Skip avg length for text/blob/unique
             length_expr = case column_type
@@ -111,7 +116,14 @@ module DbReport
         begin
           result = dataset.select(*select_expressions).first
         rescue Sequel::DatabaseError => e
-          puts colored_output("  SQL Aggregate Error: #{e.message.lines.first.strip}", :red)
+          error_message = e.message.lines.first.strip
+          puts colored_output("  SQL Aggregate Error: #{error_message}", :red)
+
+          # Special handling for tsvector errors
+          if error_message.include?('function min(tsvector)') || error_message.include?('function max(tsvector)')
+            puts colored_output("  Note: tsvector columns don't support standard SQL aggregations - skipping advanced analysis", :yellow)
+          end
+
           print_debug "  Failed SQL: #{sql_query}" if $debug
           return nil # Return nil on SQL error
         rescue StandardError => e
@@ -127,6 +139,14 @@ module DbReport
       # Populate column stats from aggregate query results
       def populate_stats_from_aggregates(col_stats, agg_results, column_type, column_sym, total_count)
         return unless agg_results # Guard against nil results
+
+        # Early return for tsvector type - only set basic counts
+        if column_type == :tsvector
+          non_null_key = :"non_null_count_#{column_sym}"
+          non_null_count = agg_results[non_null_key].to_i
+          col_stats[:null_count] = total_count - non_null_count
+          return
+        end
 
         non_null_key = :"non_null_count_#{column_sym}"
         min_key = :"min_val_#{column_sym}"

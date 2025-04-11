@@ -17,13 +17,17 @@ module DbReport
         schema.each do |col_sym, col_info|
           db_type = col_info[:db_type].to_s.downcase
           # Infer type if Sequel couldn't or if it's a generic string for specific db_types
-          if col_info[:type].nil? || col_info[:type].to_s.empty? || (col_info[:type] == :string && (db_type.include?('json') || db_type == 'uuid'))
+          if col_info[:type].nil? || col_info[:type].to_s.empty? ||
+             (col_info[:type] == :string && (db_type.include?('json') || db_type == 'uuid' || db_type == 'tsvector'))
             if db_type.include?('json')
               col_info[:type] = :json
               print_debug("    Inferred type :json for column #{col_sym} based on db_type: #{col_info[:db_type]}") if $debug
             elsif db_type == 'uuid'
               col_info[:type] = :uuid
               print_debug("    Inferred type :uuid for column #{col_sym} based on db_type: #{col_info[:db_type]}") if $debug
+            elsif db_type == 'tsvector'
+              col_info[:type] = :tsvector
+              print_debug("    Inferred type :tsvector for column #{col_sym} based on db_type: #{col_info[:db_type]}") if $debug
             end
           end
         end

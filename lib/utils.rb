@@ -101,7 +101,7 @@ module DbReport
     DEFAULT_CONNECT_TIMEOUT = 10 # Sequel uses :connect_timeout
     DEFAULT_OUTPUT_FORMAT = 'json'
     CONFIG_FILE_PATH = File.join(Dir.pwd, 'config', 'database.yml').freeze
-    OUTPUT_FORMATS = %w[json summary gpt].freeze
+    OUTPUT_FORMATS = %w[json summary gpt compact].freeze
     SEQUEL_INTERNAL_TABLES = [
       'schema_info',                 # Default table name for Sequel migrations (optional)
       'sequel_migrations'            # Common alternative name

@@ -2,6 +2,8 @@
 
 require 'json'
 require 'fileutils'
+require 'terminal-table' # Added for compact format
+require 'set'
 
 module DbReport
   class Reporter
@@ -212,6 +214,118 @@ Table: #{table_name}", :cyan, :bold)
              puts "    - Most Frequent: #{truncate_value(top_val, 40)} (#{top_count})"
           end
         end
+      end
+    end
+
+    # Print a compact summary using tables
+    def print_compact_summary
+      require 'terminal-table' # Ensure it's loaded
+      meta = report_data[:metadata]
+
+      # Print Metadata Table
+      metadata_table = Terminal::Table.new do |t|
+        t.title = colored_output("Database Analysis Summary", :magenta, :bold)
+        t.headings = ['Parameter', 'Value']
+        t.style = { border_x: "-", border_y: "|", border_i: "+" }
+        t.rows = [
+          ['Adapter', meta[:database_adapter]],
+          ['Type', meta[:database_type]],
+          ['Version', meta[:database_version]],
+          ['Generated', meta[:generated_at]],
+          ['Duration', "#{meta[:analysis_duration_seconds]}s"],
+          ['Tables Analyzed', meta[:analyzed_tables].length]
+        ]
+      end
+      puts metadata_table
+
+      # Print Table Summaries
+      report_data[:tables].each do |table_name, table_data|
+        puts # Add space before each table
+
+        if table_data.is_a?(Hash) && table_data[:error]
+          puts colored_output("Table: #{table_name} - Error: #{table_data[:error]}", :red)
+          next
+        end
+
+        unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
+           puts colored_output("Table: #{table_name} - Skipping malformed data", :yellow)
+           next
+        end
+
+        first_col_stats = table_data.values.first || {}
+        row_count = first_col_stats[:count] || 'N/A'
+
+        # Prepare data before creating the table
+        all_rows_data = []
+        initial_headers = ['Column', 'Type', 'Nulls (%)', 'Distinct', 'Min', 'Max', 'Average/AvgLen', 'Most Frequent']
+
+        table_data.each do |column_name, stats|
+          next unless stats.is_a?(Hash)
+
+          type_str = stats[:db_type].to_s
+          null_count = stats[:null_count].to_i
+          total_count = stats[:count].to_i
+          null_perc_str = total_count.positive? ? "#{null_count} (#{(null_count.to_f / total_count * 100).round(1)}%)" : "#{null_count}"
+          distinct_str = stats[:distinct_count] ? "#{stats[:distinct_count]}#{stats[:is_unique] ? ' (U)' : ''}" : ''
+
+          formatted = format_stats_for_summary(stats)
+          min_val = formatted[:min].nil? ? '' : truncate_value(formatted[:min], 15)
+          max_val = formatted[:max].nil? ? '' : truncate_value(formatted[:max], 15)
+          avg_val = if formatted.key?(:average)
+                      formatted[:average].to_s # Ensure string for emptiness check
+                    elsif formatted.key?(:avg_length)
+                      formatted[:avg_length].to_s
+                    elsif formatted.key?(:true_percentage)
+                      "#{formatted[:true_percentage]}% True"
+                    elsif formatted.key?(:avg_items)
+                      formatted[:avg_items].to_s
+                    else
+                      ''
+                    end
+
+          most_freq_str = ''
+          if formatted[:most_frequent]&.any?
+            top_val, top_count = formatted[:most_frequent].first
+            most_freq_str = "#{truncate_value(top_val, 15)} (#{top_count})"
+          end
+
+          # Collect row data (raw values before colorization where possible for checks)
+          all_rows_data << [
+            colored_output(column_name.to_s, :yellow), # Color applied here is ok
+            type_str,
+            null_perc_str,
+            distinct_str,
+            min_val,
+            max_val,
+            avg_val,
+            most_freq_str
+          ]
+        end
+
+        next if all_rows_data.empty? # Skip if no data for the table
+
+        # Determine which columns are empty
+        empty_column_indices = Set.new
+        (1...initial_headers.length).each do |col_index|
+          # Check if all values in this column index are empty strings
+          is_empty = all_rows_data.all? { |row| row[col_index].to_s.empty? }
+          empty_column_indices << col_index if is_empty
+        end
+
+        # Filter headers and rows based on empty columns
+        filtered_headers = initial_headers.reject.with_index { |_, index| empty_column_indices.include?(index) }
+        filtered_rows = all_rows_data.map do |row|
+          row.reject.with_index { |_, index| empty_column_indices.include?(index) }
+        end
+
+        # Build and print the table with filtered data
+        table_summary = Terminal::Table.new do |t|
+          t.title = colored_output("Table: #{table_name} (Rows: #{row_count})", :cyan, :bold)
+          t.headings = filtered_headers
+          t.rows = filtered_rows
+          t.style = { border_x: "-", border_y: "|", border_i: "+" }
+        end
+        puts table_summary
       end
     end
 

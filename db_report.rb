@@ -85,7 +85,7 @@ class DbReportApp
       opts.on('-l', '--list-databases', 'List available databases and exit') { options[:list_databases] = true }
       opts.on('-o', '--output FILE', 'Output report to file instead of stdout') { |f| options[:output_file] = f }
       opts.on('-t', '--tables TBLS', Array, 'Analyze only specific tables (comma-separated)') { |t| options[:tables] = t }
-      opts.on('-f', '--format FMT', DbReport::Utils::OUTPUT_FORMATS, "Output format: #{DbReport::Utils::OUTPUT_FORMATS.join('/')} (default: #{DbReport::Utils::DEFAULT_OUTPUT_FORMAT})") do |f|
+      opts.on('-f', '--format FMT', DbReport::Utils::OUTPUT_FORMATS, "Output format: json/summary/gpt/compact (default: json)") do |f|
         options[:format] = f
       end
       opts.on('-p', '--pool SIZE', Integer, "Max connections pool size (default: #{DbReport::Utils::DEFAULT_POOL_SIZE})") do |s|
@@ -264,7 +264,7 @@ Analysis finished in #{duration} seconds.", :green, :bold
     # Create reporter and output based on format
     @reporter = DbReport::Reporter.new(report_data)
     case options[:format]
-    when 'summary', 'gpt'
+    when 'summary', 'gpt', 'compact'
       output_target = options[:output_file]
       if output_target
         begin
@@ -273,7 +273,12 @@ Analysis finished in #{duration} seconds.", :green, :bold
           File.open(output_target, 'w') do |file|
             original_stdout = $stdout
             $stdout = file # Temporarily redirect stdout
-            options[:format] == 'summary' ? reporter.print_summary : reporter.print_gpt_summary
+            # Call the correct print method based on format
+            case options[:format]
+            when 'summary' then reporter.print_summary
+            when 'gpt' then reporter.print_gpt_summary
+            when 'compact' then reporter.print_compact_summary
+            end
           ensure
             $stdout = original_stdout # Ensure stdout is restored
           end
@@ -285,7 +290,11 @@ Analysis finished in #{duration} seconds.", :green, :bold
         end
       else
         # Original behavior: print directly to current stdout
-        options[:format] == 'summary' ? reporter.print_summary : reporter.print_gpt_summary
+        case options[:format]
+        when 'summary' then reporter.print_summary
+        when 'gpt' then reporter.print_gpt_summary
+        when 'compact' then reporter.print_compact_summary
+        end
       end
     when 'json' then reporter.write_json(options[:output_file])
     # Add other formats here if needed

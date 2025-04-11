@@ -105,5 +105,29 @@ module DbReport
       'schema_info',                 # Default table name for Sequel migrations (optional)
       'sequel_migrations'            # Common alternative name
     ].freeze
+
+    # Helper to check if a config specifies a database name
+    # @param config [String, Hash, nil] The configuration object
+    # @return [Boolean] True if a database name is present, false otherwise
+    def database_name_present?(config)
+      case config
+      when String # URL
+        begin
+          uri = URI.parse(config)
+          # Check if path is present and not just "/"
+          !uri.path.nil? && uri.path.length > 1
+        rescue URI::InvalidURIError
+          false # Invalid URL likely doesn't specify a DB
+        end
+      when Hash # Hash
+        # Check if :database key exists and is not empty
+        !config[:database].to_s.empty?
+      else
+        false # Not a String or Hash
+      end
+    end
+
+    # Make it available as a class method too if needed elsewhere statically
+    module_function :database_name_present?
   end
 end

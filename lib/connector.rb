@@ -97,63 +97,127 @@ module DbReport
     end
 
     # Establish the database connection using Sequel
-    def connect
-      print_info 'Attempting to connect to database using Sequel...'
+    # Handles connecting to a default DB first if listing is required, then to the target DB.
+    # @param list_mode [Boolean] If true, prioritize connecting without a specific DB name.
+    # @return [Sequel::Database, nil] The connection object or nil if connection fails.
+    def connect(list_mode: false)
+      print_info "Attempting to connect to database using Sequel..." # Keep general message
 
-      connection_config = config # Can be String (URL) or Hash
       connection_options = {
         max_connections: pool_size,
         connect_timeout: connect_timeout
       }
 
-      if connection_config.is_a?(Hash)
-        # Ensure hash config keys are symbols for Sequel
-        connection_config = connection_config.transform_keys(&:to_sym)
-        adapter = connection_config[:adapter]
-        print_info "Using config: adapter=#{adapter || '?'}, database=#{connection_config[:database] || '?'}, host=#{connection_config[:host] || 'localhost'}, user=#{connection_config[:user] || '?'}"
-        print_info "Connection pool size: #{pool_size}"
-        check_adapter_availability(adapter) if adapter
-        # Merge options into the config hash for Sequel.connect
-        connection_config.merge!(connection_options)
-      elsif connection_config.is_a?(String) # URL
-        masked_url = connection_config.gsub(/:[^:]*@/, ':*****@')
-        print_info "Using connection string: #{masked_url}"
+      # Separate config for initial connection (maybe without DB name) and target DB
+      initial_config = nil
+      target_config = config # The config determined by Config class
+      target_db_name = nil
+      adapter = nil
+
+      # --- Determine Adapter and Target DB Name early --- #
+      case target_config
+      when Hash
+        target_config = target_config.transform_keys(&:to_sym)
+        adapter = target_config[:adapter]
+        target_db_name = target_config[:database]
+      when String # URL
         begin
-          adapter = URI.parse(connection_config).scheme
-          check_adapter_availability(adapter) if adapter
+          uri = URI.parse(target_config)
+          adapter = uri.scheme
+          target_db_name = uri.path&.sub(%r{^/}, '')
         rescue URI::InvalidURIError
-          print_warning 'Could not parse adapter from URL to check gem.'
+          print_warning 'Could not parse adapter/database from URL.'
         end
-        # Pass options separately when connecting with a URL string
       else
-        abort_with_error 'Invalid database configuration provided.'
+        abort_with_error 'Invalid database configuration type provided.'
       end
 
-      begin
-        @db_connection = if connection_config.is_a?(String)
-                          Sequel.connect(connection_config, connection_options)
-                        else
-                          Sequel.connect(connection_config) # Options are already merged
-                        end
+      # Abort if adapter cannot be determined
+      abort_with_error "Could not determine database adapter from config." unless adapter
 
-        @db_connection.loggers << Logger.new($stdout) if debug
-        @db_connection.test_connection
-        print_info 'Successfully connected to database using Sequel'
+      # Ensure the necessary adapter gem is available
+      check_adapter_availability(adapter)
 
-      rescue Sequel::DatabaseConnectionError => e
-        error_message = "Failed to connect to database: #{e.message}"
-        tips = build_connection_error_tips(e, config)
-        abort_with_error "#{error_message}\n  • #{tips}"
-      rescue LoadError => e
-         abort_with_error("Failed to load database adapter gem: #{e.message}. Ensure the required gem (e.g., 'pg', 'mysql2', 'sqlite3') is installed.")
-      rescue StandardError => e
-        error_message = "An unexpected error occurred during connection: #{e.message}"
-        tips = build_connection_error_tips(e, config)
-        abort_with_error "#{error_message}\n  • #{tips}"
+      # --- Prepare Initial Connection Config (for listing or base connection) --- #
+      if list_mode || target_db_name.to_s.empty?
+        print_debug "List mode or no target DB name specified. Preparing base connection config."
+        # Try to connect without a specific DB name or to a default one
+        case adapter.to_sym
+        when :postgres, :postgresql
+          # Connect to 'postgres' maintenance database if target is missing/empty
+          default_db = 'postgres'
+          print_debug "PostgreSQL: Attempting connection to '#{default_db}' for listing/base."
+          initial_config = build_connection_config(target_config, adapter, default_db)
+        when :mysql, :mysql2
+          # MySQL can often connect without a database name specified
+          print_debug "MySQL: Attempting connection without specific database name for listing/base."
+          initial_config = build_connection_config(target_config, adapter, nil) # Explicitly nil DB
+        when :sqlite, :sqlite3
+          # SQLite requires a file path or :memory:. Cannot list other DBs.
+          # If target_db_name is missing, we can't connect meaningfully for listing.
+          if target_db_name.to_s.empty?
+            abort_with_error "SQLite requires a database file path or ':memory:'. Cannot connect without one."
+          else
+            # If a target DB *is* specified, use that for the initial connection too.
+            initial_config = build_connection_config(target_config, adapter, target_db_name)
+          end
+        else
+          print_warning "Adapter '#{adapter}' might not support connecting without a database name. Attempting anyway..."
+          initial_config = build_connection_config(target_config, adapter, nil)
+        end
+      else
+        # If not list mode and a target DB *is* specified, use it for the initial connection.
+        print_debug "Target DB '#{target_db_name}' specified and not in list mode. Using target config for initial connection."
+        initial_config = build_connection_config(target_config, adapter, target_db_name)
       end
 
-      @db_connection # Return the connection object
+      # --- Attempt Initial Connection --- #
+      print_connection_info("initial config", initial_config)
+      @db_connection = attempt_sequel_connect(initial_config, connection_options)
+
+      # If initial connection failed, abort
+      unless @db_connection
+        # Error message handled within attempt_sequel_connect
+        return nil # Indicate failure
+      end
+
+      print_info "Successfully established base connection using Sequel."
+
+      # --- If in list mode, we are done --- #
+      if list_mode
+        print_debug "Connection established in list mode. Returning base connection."
+        return @db_connection
+      end
+
+      # --- If not list mode, ensure we are connected to the correct TARGET database --- #
+      # If initial connection already used the target DB, we're good.
+      if config_database_name(initial_config) == target_db_name
+        print_debug "Initial connection already used target database '#{target_db_name}'."
+      else
+        # Need to switch or reconnect to the target database if possible and necessary
+        print_debug "Base connection established. Now attempting connection to target database '#{target_db_name}'."
+        target_full_config = build_connection_config(target_config, adapter, target_db_name)
+
+        # Close the initial connection before establishing the target one
+        disconnect_safely(@db_connection)
+        @db_connection = nil # Reset connection
+
+        print_connection_info("target config", target_full_config)
+        @db_connection = attempt_sequel_connect(target_full_config, connection_options)
+
+        unless @db_connection
+          # Error handled by attempt_sequel_connect
+          return nil
+        end
+        print_info "Successfully connected to target database '#{target_db_name}' using Sequel."
+      end
+
+      # Final check and return the connection (should be target DB connection now)
+      @db_connection&.loggers << Logger.new($stdout) if debug && @db_connection
+      @db_connection
     end
+
+    # --- Public Methods --- #
 
     # Disconnect the database connection
     def disconnect
@@ -235,6 +299,106 @@ module DbReport
       rescue StandardError => e
         print_warning "Unexpected error listing databases: #{e.message}"
         []
+      end
+    end
+
+    private
+
+    # Helper to safely disconnect a specific connection object
+    def disconnect_safely(conn)
+      conn&.disconnect
+    rescue StandardError => e
+      print_warning "Error during intermediate disconnect: #{e.message}"
+    end
+
+    # Helper to get database name from config (String or Hash)
+    def config_database_name(cfg)
+      case cfg
+      when Hash then cfg[:database]
+      when String
+        begin
+          URI.parse(cfg).path&.sub(%r{^/}, '')
+        rescue URI::InvalidURIError
+          nil
+        end
+      else nil
+      end
+    end
+
+    # Helper to build a connection config (Hash or String) for Sequel
+    # @param base_config [Hash, String] Original config from options/file/env
+    # @param adapter [Symbol, String] The database adapter
+    # @param db_name [String, nil] The specific database name to use (or nil)
+    # @return [Hash, String] A config suitable for Sequel.connect
+    def build_connection_config(base_config, adapter, db_name)
+      case base_config
+      when Hash
+        # Create a new hash to avoid modifying the original
+        new_config = base_config.dup
+        new_config[:adapter] = adapter.to_s # Ensure adapter is string if needed
+        if db_name.nil?
+          # Remove database key if we want to connect without one (e.g., MySQL listing)
+          new_config.delete(:database)
+        else
+          new_config[:database] = db_name
+        end
+        new_config
+      when String # URL
+        begin
+          uri = URI.parse(base_config)
+          uri.scheme = adapter.to_s # Ensure adapter is correct
+          # Set path only if db_name is provided
+          uri.path = db_name ? "/#{db_name}" : '' # Empty path for no DB
+          uri.to_s
+        rescue URI::InvalidURIError => e
+          print_warning "Could not build connection URL: #{e.message}"
+          base_config # Fallback to original
+        end
+      else
+        base_config # Return as is if not Hash or String
+      end
+    end
+
+    # Helper to print connection info, masking password in URL
+    def print_connection_info(label, conn_config)
+      info_str = if conn_config.is_a?(String)
+                   conn_config.gsub(/:[^:]*@/, ':*****@')
+                 elsif conn_config.is_a?(Hash)
+                   cfg = conn_config.dup
+                   cfg[:password] = '*****' if cfg.key?(:password)
+                   cfg.inspect
+                 else
+                   conn_config.inspect
+                 end
+      print_info "Using #{label}: #{info_str}"
+    end
+
+    # Internal helper to attempt connection and handle errors
+    def attempt_sequel_connect(conn_config, conn_options)
+      begin
+        connection = if conn_config.is_a?(String)
+                       Sequel.connect(conn_config, conn_options)
+                     else
+                       # Merge options into hash config for Sequel.connect
+                       merged_config = conn_config.merge(conn_options)
+                       Sequel.connect(merged_config)
+                     end
+        connection.test_connection
+        connection # Return the connection object
+      rescue Sequel::DatabaseConnectionError => e
+        error_message = "Failed to connect to database: #{e.message}"
+        # Use the config passed to *this* attempt for tips
+        tips = build_connection_error_tips(e, conn_config)
+        abort_with_error "#{error_message}\n  • #{tips}"
+        nil # Return nil on failure
+      rescue LoadError => e
+        abort_with_error("Failed to load database adapter gem: #{e.message}. Ensure the required gem (e.g., 'pg', 'mysql2', 'sqlite3') is installed.")
+        nil
+      rescue StandardError => e
+        error_message = "An unexpected error occurred during connection: #{e.message}"
+        tips = build_connection_error_tips(e, conn_config)
+        abort_with_error "#{error_message}\n  • #{tips}"
+        nil
       end
     end
 

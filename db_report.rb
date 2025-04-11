@@ -102,7 +102,7 @@ class DbReportApp
     options[:environment] ||= DbReport::Utils::DEFAULT_ENVIRONMENT
 
     options
-  rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
+  rescue OptionParser::InvalidOption, OptionParser::MissingArgument, OptionParser::AmbiguousOption => e
     # Use instance method colored_output available via include
     puts colored_output("Error: #{e.message}", :red)
     puts parser # Show help on error
@@ -166,14 +166,26 @@ class DbReportApp
 
     # 2. Establish Connection
     @connector = DbReport::Connector.new(db_config, options[:pool], options[:connect_timeout], options[:debug])
-    db_connection = connector.connect # Establish connection
 
-    # Handle --list-databases immediately after connection
-    if options[:list_databases]
+    # Determine if we need to list databases *before* attempting the final connection
+    should_list_databases = options[:list_databases] || !DbReport::Utils.database_name_present?(db_config)
+
+    # Connect: Pass list_mode=true if we need to list databases
+    db_connection = connector.connect(list_mode: should_list_databases)
+
+    # If connection failed (handled within connect method), exit.
+    exit 1 unless db_connection
+
+    # If we established a connection *only* for listing databases, list and exit.
+    if should_list_databases
       handle_list_databases
+      # Explicitly disconnect the base connection used for listing
+      connector.disconnect
       return # Exit after listing
     end
 
+    # If we reached here, we have a connection to the target database.
+    # Proceed with analysis.
     # Display connection info if debugging
     connector.display_connection_info
     connector.print_database_info # Show basic connection info regardless of debug

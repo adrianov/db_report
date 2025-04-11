@@ -85,7 +85,7 @@ class DbReportApp
       opts.on('-l', '--list-databases', 'List available databases and exit') { options[:list_databases] = true }
       opts.on('-o', '--output FILE', 'Output report to file instead of stdout') { |f| options[:output_file] = f }
       opts.on('-t', '--tables TBLS', Array, 'Analyze only specific tables (comma-separated)') { |t| options[:tables] = t }
-      opts.on('-f', '--format FMT', DbReport::Utils::OUTPUT_FORMATS, "Output format: json/summary/gpt/compact (default: json)") do |f|
+      opts.on('-f', '--format FMT', DbReport::Utils::OUTPUT_FORMATS, "Output format: json/summary/gpt/compact (default: compact)") do |f|
         options[:format] = f
       end
       opts.on('-p', '--pool SIZE', Integer, "Max connections pool size (default: #{DbReport::Utils::DEFAULT_POOL_SIZE})") do |s|

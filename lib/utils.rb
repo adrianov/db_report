@@ -99,7 +99,7 @@ module DbReport
     DEFAULT_ENVIRONMENT = ENV.fetch('RAILS_ENV', 'development')
     DEFAULT_POOL_SIZE = ENV.fetch('DB_POOL', 5).to_i # Sequel uses :max_connections
     DEFAULT_CONNECT_TIMEOUT = 10 # Sequel uses :connect_timeout
-    DEFAULT_OUTPUT_FORMAT = 'json'
+    DEFAULT_OUTPUT_FORMAT = 'compact'
     CONFIG_FILE_PATH = File.join(Dir.pwd, 'config', 'database.yml').freeze
     OUTPUT_FORMATS = %w[json summary gpt compact].freeze
     SEQUEL_INTERNAL_TABLES = [

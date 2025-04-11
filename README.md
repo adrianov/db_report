@@ -199,59 +199,55 @@ The JSON output includes metadata and detailed stats per table/column:
 ```json
 {
   "metadata": {
-    "generated_at": "2024-07-28T10:00:00+00:00",
-    "database_adapter": "postgresql",
+    "generated_at": "2025-04-11T18:46:19+03:00",
+    "database_adapter": "postgres",
     "database_type": "postgres",
-    "database_version": "PostgreSQL 15.3 (...) ...",
-    "analyzed_tables": [
-      "public.users",
-      "public.orders"
-    ],
-    "analysis_duration_seconds": 15.72,
+    "database_version": "PostgreSQL 14.17 (Homebrew) on aarch64-apple-darwin24.2.0...",
+    "analyzed_tables": ["user_favorites", "users", "users_favorites_words", "words"],
+    "analysis_duration_seconds": 0.16,
     "parallel_processing": true,
-    "parallel_processes": 8
+    "search_value": "cat",
+    "parallel_processes": "auto-detected"
   },
   "tables": {
-    "public.users": {
+    "users": {
       "id": {
-        "type": "integer",
-        "db_type": "integer",
-        "count": 10000,
-        "null_count": 0,
-        "min": 1,
-        "max": 10000,
-        "is_unique": true
+        "type": "uuid", "db_type": "uuid", "count": 1, "null_count": 0,
+        "min": "5e3a46e4-21c4-4190-9637-074abba6dcfe",
+        "max": "5e3a46e4-21c4-4190-9637-074abba6dcfe", "avg": 36.0
       },
       "email": {
-        "type": "string",
-        "db_type": "character varying",
-        "count": 10000,
-        "null_count": 0,
-        "min": 12, // Min length
-        "max": 255, // Max length
-        "avg": 32.4, // Avg length
-        "distinct_count": 9995,
-        "most_frequent": {
-          "test@example.com": 5
-        },
-        "least_frequent": {
-          "user9999@example.com": 1
-        },
-        "is_unique": false
+        "type": "string", "db_type": "character varying", "count": 1, "null_count": 0,
+        "min": "admin@example.com", "max": "admin@example.com", "is_unique": true
       },
-      "created_at": {
-        "type": "datetime",
-        "db_type": "timestamp without time zone",
-        "count": 10000,
-        "null_count": 0,
-        "min": "2023-01-10T00:00:00+00:00",
-        "max": "2024-07-28T09:59:00+00:00",
-        "distinct_count": 9876,
-        "is_unique": false
+      "preferences": {
+        "type": "json", "db_type": "jsonb", "count": 1, "null_count": 0,
+        "min": "{\"theme\": \"light\", \"notifications\": true, \"defaultLanguage\": \"en\"}",
+        "found": true, "search_value": "cat"
       }
-      // ... other columns
+    },
+    "words": {
+      "id": {
+        "type": "uuid", "db_type": "uuid", "count": 6, "null_count": 0,
+        "min": "29cc3963-690f-413f-8c29-937c3a6df3d6",
+        "max": "ca114a89-e070-4a46-8618-749277f53911", "avg": 36.0
+      },
+      "word": {
+        "type": "string", "db_type": "character varying", "count": 6, "null_count": 0,
+        "min": "Freund", "max": "мир", "avg": 4.8, "distinct_count": 6,
+        "most_frequent": {"Freund": 1, "amor": 1, "bonjour": 1, "casa": 1, "hello": 1}
+      },
+      "isActive": {
+        "type": "boolean", "db_type": "boolean", "count": 6, "null_count": 0,
+        "min": 1, "max": 1, "true_percentage": 100.0,
+        "most_frequent": {"true": 6}
+      }
     }
-    // ... other tables
+  },
+  "search_summary": {
+    "search_value": "cat",
+    "total_found": 1,
+    "found_locations": ["users.preferences"]
   }
 }
 ```

@@ -466,61 +466,94 @@ rescue StandardError => e
   0
 end
 
-# Build the TABLESAMPLE clause (using Sequel's dataset method)
-# This function now returns a dataset modifier lambda/proc
-def build_sample_modifier(sample_size, total_count)
-  return nil unless sample_size && total_count > 0 && $db.database_type == :postgres
-
-  sample_percentage = (sample_size.to_f / total_count * 100).clamp(0.01, 100)
-
-  # Return a proc that modifies a dataset
-  ->(dataset) { dataset.tablesample(:system, sample_percentage) }
-rescue StandardError => e
-  print_warning "Could not build sample modifier: #{e.message}"
-  nil
-end
-
 # Helper to safely run aggregate queries using Sequel datasets
 def execute_aggregate_query(dataset, select_expressions)
-  dataset.select(*select_expressions).first # Returns a hash or nil
-rescue Sequel::DatabaseError => e
-  puts colored_output("  SQL Aggregate Error: #{e.message.lines.first.strip}", :red)
-  print_debug "  Dataset: #{dataset.sql}"
-  nil
-rescue StandardError => e
-  puts colored_output("  Error (Aggregate Query): #{e.message.lines.first.strip}", :red)
-  nil
+  sql_query = dataset.select(*select_expressions).sql
+  print_debug("  Executing Aggregates: #{sql_query}") if $debug
+
+  start_time = Time.now
+  result = nil
+  begin
+    result = dataset.select(*select_expressions).first # Returns a hash or nil
+  rescue Sequel::DatabaseError => e
+    puts colored_output("  SQL Aggregate Error: #{e.message.lines.first.strip}", :red)
+    print_debug "  Failed SQL: #{sql_query}" if $debug # Log the failed query
+    return nil # Return nil on SQL error
+  rescue StandardError => e
+    puts colored_output("  Error (Aggregate Query): #{e.message.lines.first.strip}", :red)
+    return nil # Return nil on other errors
+  ensure
+    duration = (Time.now - start_time).round(4)
+    print_debug("  Aggregates Duration: #{duration}s") if $debug
+  end
+  result
 end
 
 # Helper to safely run frequency queries using Sequel datasets
 def execute_frequency_query(dataset, column_sym)
   # Use group_and_count for frequency
-  dataset.group_and_count(column_sym).all # Returns array of hashes like { col_sym => value, :count => n }
-rescue Sequel::DatabaseError => e
-  puts colored_output("  SQL Frequency Error: #{e.message.lines.first.strip}", :red)
-  print_debug "  Dataset: #{dataset.sql}"
-  []
-rescue StandardError => e
-  puts colored_output("  Error (Frequency Query): #{e.message.lines.first.strip}", :red)
-  []
+  freq_dataset = dataset.group_and_count(column_sym)
+  sql_query = freq_dataset.sql
+  print_debug("  Executing Frequency: #{sql_query}") if $debug
+
+  start_time = Time.now
+  result = []
+  begin
+    # Execute the query
+    result = freq_dataset.all # Returns array of hashes like { col_sym => value, :count => n }
+  rescue Sequel::DatabaseError => e
+    puts colored_output("  SQL Frequency Error: #{e.message.lines.first.strip}", :red)
+    print_debug "  Failed SQL: #{sql_query}" if $debug
+    return [] # Return empty array on SQL error
+  rescue StandardError => e
+    puts colored_output("  Error (Frequency Query): #{e.message.lines.first.strip}", :red)
+    return [] # Return empty array on other errors
+  ensure
+    duration = (Time.now - start_time).round(4)
+    print_debug("  Frequency Duration: #{duration}s") if $debug
+  end
+  result
 end
 
 # Build SELECT clause parts for aggregate query based on column type using Sequel functions/literals
 def build_aggregate_select_parts(column_type, column_sym, adapter_type, is_unique)
-  parts = [Sequel.function(:COUNT, column_sym).as(:non_null_count)]
+  # Generate unique aliases based on the column symbol
+  non_null_alias = :"non_null_count_#{column_sym}"
+  min_alias = :"min_val_#{column_sym}"
+  max_alias = :"max_val_#{column_sym}"
+  avg_alias = :"avg_val_#{column_sym}"
+  true_count_alias = :"true_count_#{column_sym}"
+  distinct_count_alias = :"distinct_count_#{column_sym}" # Alias for distinct count
+
+  parts = [Sequel.function(:COUNT, column_sym).as(non_null_alias)]
+  is_primary_or_foreign_key = is_unique || column_sym == :id || column_sym.to_s.end_with?('_id')
+  groupable = !%i[text blob json jsonb xml array hstore].include?(column_type)
 
   case column_type
   when :integer, :float, :decimal, :string, :text, :date, :datetime, :time, :boolean, :blob, :enum, :uuid, :inet, :json, :jsonb, :xml # Consolidate types with min/max
     parts += [
-      Sequel.function(:MIN, column_sym).as(:min_val),
-      Sequel.function(:MAX, column_sym).as(:max_val)
+      Sequel.function(:MIN, column_sym).as(min_alias),
+      Sequel.function(:MAX, column_sym).as(max_alias)
     ]
 
-    # Add AVG for numeric types (only if not unique)
-    if !is_unique && [:integer, :float, :decimal].include?(column_type)
+    # Add AVG for numeric types unless it's unique, named 'id', or ends with '_id'
+    if !is_primary_or_foreign_key && [:integer, :float, :decimal].include?(column_type)
       # Cast to float for AVG (double precision is common)
       cast_type = adapter_type == :mysql ? :double : :'double precision'
-      parts << Sequel.function(:AVG, Sequel.cast(column_sym, cast_type)).as(:avg_val)
+      parts << Sequel.function(:AVG, Sequel.cast(column_sym, cast_type)).as(avg_alias)
+      print_debug("    Adding AVG for numeric column: #{column_sym}") if $debug
+    elsif $debug && [:integer, :float, :decimal].include?(column_type)
+        print_debug("    Skipping AVG for numeric column: #{column_sym} (pk/fk: #{is_primary_or_foreign_key})")
+    end
+
+    # Add COUNT(DISTINCT) for groupable types unless it's unique, named 'id', or ends with '_id'
+    if groupable && !is_primary_or_foreign_key
+      parts << Sequel.function(:COUNT, Sequel.function(:DISTINCT, column_sym)).as(distinct_count_alias)
+      print_debug("    Adding COUNT(DISTINCT) for: #{column_sym}") if $debug
+    elsif $debug && groupable
+      print_debug("    Skipping COUNT(DISTINCT) for PK/FK/Unique: #{column_sym}")
+    elsif $debug
+      print_debug("    Skipping COUNT(DISTINCT) for non-groupable type: #{column_sym}")
     end
 
     # Add AVG length for string/text/complex types (only if not unique)
@@ -538,47 +571,65 @@ def build_aggregate_select_parts(column_type, column_sym, adapter_type, is_uniqu
                     else
                       Sequel.function(:length, column_sym) # Default assumption
                     end
-      parts << Sequel.function(:AVG, length_expr).as(:avg_val) # Avg length
+      parts << Sequel.function(:AVG, length_expr).as(avg_alias) # Avg length
     end
 
   when :boolean # Handle boolean true count separately
     # SUM(CASE WHEN col THEN 1 ELSE 0 END)
-    parts << Sequel.function(:SUM, Sequel.case({ column_sym => 1 }, 0)).as(:true_count)
+    parts << Sequel.function(:SUM, Sequel.case({ column_sym => 1 }, 0)).as(true_count_alias)
+    # Also add distinct count for boolean if not PK/FK
+    if !is_primary_or_foreign_key
+      parts << Sequel.function(:COUNT, Sequel.function(:DISTINCT, column_sym)).as(distinct_count_alias)
+      print_debug("    Adding COUNT(DISTINCT) for boolean: #{column_sym}") if $debug
+    elsif $debug
+      print_debug("    Skipping COUNT(DISTINCT) for PK/FK/Unique boolean: #{column_sym}")
+    end
 
   when :array # PostgreSQL specific array handling
     if adapter_type == :postgres
       parts += [
-        Sequel.function(:MIN, Sequel.function(:array_length, column_sym, 1)).as(:min_val),
-        Sequel.function(:MAX, Sequel.function(:array_length, column_sym, 1)).as(:max_val)
+        Sequel.function(:MIN, Sequel.function(:array_length, column_sym, 1)).as(min_alias),
+        Sequel.function(:MAX, Sequel.function(:array_length, column_sym, 1)).as(max_alias)
       ]
       # Add AVG array length (only if not unique)
-      parts << Sequel.function(:AVG, Sequel.function(:array_length, column_sym, 1)).as(:avg_val) if !is_unique
+      parts << Sequel.function(:AVG, Sequel.function(:array_length, column_sym, 1)).as(avg_alias) if !is_unique
     else
       print_warning "    Skipping array aggregates for non-PostgreSQL DB"
     end
+    # Do not add distinct count for arrays, as it's complex and often not useful
+    print_debug("    Skipping COUNT(DISTINCT) for array type: #{column_sym}") if $debug
+
   # No specific aggregates for hstore, uuid, inet beyond min/max unless needed
-  else
-    print_warning "    Skipping aggregates for unhandled type: #{column_type}" if $debug
   end
   parts
 end
 
 # Populate column stats from aggregate query results (keys are symbols from Sequel)
-def populate_stats_from_aggregates(col_stats, agg_results, column_type, effective_count)
+def populate_stats_from_aggregates(col_stats, agg_results, column_type, column_sym, total_count)
   return unless agg_results # agg_results is a hash
 
-  non_null_count = agg_results[:non_null_count].to_i
-  col_stats[:null_count] = effective_count - non_null_count
-  col_stats[:min] = agg_results[:min_val] # nil if not present
-  col_stats[:max] = agg_results[:max_val] # nil if not present
+  # Use column_sym to construct the correct keys
+  non_null_key = :"non_null_count_#{column_sym}"
+  min_key = :"min_val_#{column_sym}"
+  max_key = :"max_val_#{column_sym}"
+  avg_key = :"avg_val_#{column_sym}"
+  true_count_key = :"true_count_#{column_sym}"
+  distinct_count_key = :"distinct_count_#{column_sym}" # Key for distinct count
+
+  non_null_count = agg_results[non_null_key].to_i
+  col_stats[:null_count] = total_count - non_null_count
+  col_stats[:min] = agg_results[min_key] # nil if not present
+  col_stats[:max] = agg_results[max_key] # nil if not present
+  # Extract distinct count if present
+  col_stats[:distinct_count] = agg_results[distinct_count_key].to_i if agg_results.key?(distinct_count_key)
 
   # Handle avg/percentage
   if column_type == :boolean && non_null_count > 0
-    true_count = agg_results[:true_count].to_i
+    true_count = agg_results[true_count_key].to_i
     col_stats[:true_percentage] = (true_count.to_f / non_null_count) * 100
-  elsif agg_results[:avg_val]
+  elsif agg_results[avg_key]
     # Ensure avg is float, handle potential BigDecimal from AVG
-    col_stats[:avg] = agg_results[:avg_val].to_f rescue nil
+    col_stats[:avg] = agg_results[avg_key].to_f rescue nil
   end
 
   # Format date/time nicely (Sequel often returns Time/Date objects)
@@ -590,83 +641,70 @@ end
 
 # Fetch and store most and least frequent values using Sequel datasets
 def analyze_frequency(col_stats, column_sym, base_dataset, column_type, unique_single_columns)
-  # Skip frequency analysis for columns with a single-column unique index
-  return if unique_single_columns.include?(column_sym)
+  # Skip frequency analysis if:
+  # - Column is not groupable (text, blob, json, etc.)
+  # - Column is known unique (is_unique flag or from index check)
+  # - Column is likely a PK/FK (name is 'id' or ends with '_id')
+  groupable = !%i[text blob json jsonb xml array hstore].include?(column_type)
+  is_pk_or_fk = col_stats[:is_unique] || unique_single_columns.include?(column_sym) || column_sym == :id || column_sym.to_s.end_with?('_id')
 
-  # Avoid grouping on large text/binary/complex types, allow enum
-  groupable = !%i[text blob json jsonb xml array hstore].include?(column_type) # Use Sequel type symbols
-  return unless groupable && col_stats[:count] > 0 && !col_stats[:is_unique] # Also skip if known unique
+  unless groupable
+    print_debug("    Skipping frequency analysis for non-groupable type: #{column_sym} (#{column_type})") if $debug
+    return
+  end
 
-  # Base dataset for frequency (already includes sampling if applied)
-  freq_dataset = base_dataset.where { Sequel.~(column_sym => nil) } # WHERE col IS NOT NULL
+  if is_pk_or_fk
+    print_debug("    Skipping frequency analysis for PK/FK or unique column: #{column_sym}") if $debug
+    return
+  end
+
+  # Continue only if column is groupable and not a PK/FK/Unique
+  return unless col_stats[:count] > 0
+
+  # Base dataset for frequency - REMOVED redundant IS NOT NULL clause
+  freq_dataset = base_dataset # No longer need .where { Sequel.~(column_sym => nil) }
 
   # Most Frequent
+  # Group by implicitly handles NULLs, count(*) counts non-null occurrences per group
   most_freq_results = execute_frequency_query(freq_dataset.order(Sequel.desc(:count), column_sym).limit(5), column_sym)
-  # Result format: [{column_sym => value, :count => n}, ...]
   col_stats[:most_frequent] = most_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
 
   # Least Frequent (only if worthwhile)
-  # Check distinct count first (can be expensive)
-  # Use dataset.distinct(column).count to avoid potential DISTINCT * issues with complex types like JSON
-  distinct_count = freq_dataset.distinct(column_sym).count rescue 0
+  distinct_count = col_stats[:distinct_count] || 0
 
-  if distinct_count > 5 # If more than 5 distinct values exist
+  if distinct_count > 5
+    # Group by implicitly handles NULLs
     least_freq_results = execute_frequency_query(freq_dataset.order(Sequel.asc(:count), column_sym).limit(5), column_sym)
     col_stats[:least_frequent] = least_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
   elsif distinct_count > 0 && distinct_count <= 5 && col_stats[:most_frequent].empty?
-    # If few distinct values and most_frequent failed, populate with all values
     all_freq_results = execute_frequency_query(freq_dataset.order(Sequel.asc(:count), column_sym), column_sym)
     col_stats[:most_frequent] = all_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
   end
+
 rescue Sequel::DatabaseError => e
-  print_warning "    Frequency analysis failed for #{column_sym}: #{e.message.lines.first.strip}"
+  # ... error handling ...
 rescue StandardError => e
-  print_warning "    Unexpected error in frequency analysis for #{column_sym}: #{e.message}"
+  # ... error handling ...
 end
 
 # Analyze a single table using Sequel (needs to handle qualified names)
-def analyze_table(table_name_string, sample_size)
+def analyze_table(table_name_string)
   # Use the helper to create a qualified identifier for Sequel operations
   table_identifier = create_sequel_identifier(table_name_string)
 
-  print_info "Analyzing table: #{table_name_string}#{sample_size ? " (sample size: ~#{sample_size})" : ''}", :cyan, :bold
+  print_info "Analyzing table: #{table_name_string}", :cyan, :bold
   adapter_type = $db.database_type
   table_stats = {}
   columns_schema = {}
+  all_agg_results = nil # Initialize outside the retry block
+  total_count = 0 # Initialize total_count
 
   begin
     # Get schema using the potentially qualified identifier
     columns_schema = $db.schema(table_identifier).to_h { |col_info| [col_info[0], col_info[1]] } # { col_name_sym => {db_type:, type:, ...}}
 
-    # --- Refactored Count and Sampling Logic (Use identifier) ---
-    print_debug "PID #{Process.pid}: Getting count for #{table_name_string}..."
-    total_count = $db[table_identifier].count # Get total count using the identifier
-    print_debug "PID #{Process.pid}: Got count #{total_count} for #{table_name_string}."
-
-    # Base dataset using the identifier
+    # Base dataset using the identifier (no more sampling)
     base_dataset = $db[table_identifier]
-    effective_count = total_count
-    sample_modifier = nil
-
-    if sample_size && total_count > 0
-      sample_modifier = build_sample_modifier(sample_size, total_count)
-      if sample_modifier
-        # Apply sampling if modifier was created (PG only for now)
-        base_dataset = sample_modifier.call(base_dataset)
-        effective_count = [sample_size, total_count].min # Use sample size as effective count
-      elsif $db.respond_to?(:rand) # Fallback: Use ORDER BY RAND() LIMIT N if adapter supports it (less efficient)
-          print_warning "  TABLESAMPLE not supported/failed, attempting ORDER BY RAND() LIMIT #{sample_size} (may be slow/inaccurate)"
-          base_dataset = base_dataset.order($db.random).limit(sample_size)
-          effective_count = base_dataset.count # Get actual count after sampling
-      else
-        print_warning "  Sampling not supported for this database or configuration."
-        # Proceed without sampling
-      end
-    elsif sample_size && total_count == 0
-      print_debug "  Skipping sampling for empty table: #{table_name_string}"
-      effective_count = 0
-    end
-    # --- End Refactored Logic ---
 
     # Fetch indexes using the potentially qualified identifier (as string or symbol)
     unique_single_columns = Set.new
@@ -689,49 +727,79 @@ def analyze_table(table_name_string, sample_size)
       print_warning "  Unexpected error fetching indexes for #{table_name_string}: #{e.message}"
     end
 
+    # --- Aggregate Query Refactoring ---
+    # Add COUNT(*) to the list of expressions
+    all_select_parts = [Sequel.function(:COUNT, Sequel.lit('*')).as(:_total_count)]
+    initial_col_stats = {} # Store initial stats before query
+
+    # 1. Build all aggregate expressions and initial stats
     columns_schema.each do |column_sym, column_info|
-      column_type = column_info[:type] # Sequel's abstracted type symbol (:string, :integer, etc.)
-      db_type = column_info[:db_type] # Original database type string
-      # Determine if the current column is unique based on the fetched indexes
+      column_type = column_info[:type]
+      db_type = column_info[:db_type]
       is_unique = unique_single_columns.include?(column_sym)
-      print_info "  - Analyzing column: #{column_sym} (#{column_type}/#{db_type})#{is_unique ? ' (unique)' : ''}", :white
 
-      col_stats = { type: column_type.to_s, db_type: db_type, count: effective_count, null_count: 0,
-                    min: nil, max: nil, avg: nil, true_percentage: nil,
-                    most_frequent: {}, least_frequent: {}, is_unique: is_unique }
+      # Initialize with count 0, will be populated after query
+      initial_col_stats[column_sym] = {
+        type: column_type.to_s, db_type: db_type, count: 0, null_count: 0,
+        min: nil, max: nil, avg: nil, true_percentage: nil, distinct_count: nil,
+        most_frequent: {}, least_frequent: {}, is_unique: is_unique
+      }
 
-      # Build aggregate expressions for this column, passing the is_unique flag
-      select_parts = build_aggregate_select_parts(column_type, column_sym, adapter_type, is_unique)
+      # Build aggregate expressions for this column
+      col_select_parts = build_aggregate_select_parts(column_type, column_sym, adapter_type, is_unique)
+      all_select_parts.concat(col_select_parts) # Add this column's parts to the main list
+    end
 
-      if select_parts.any?
-        begin
-          # Execute aggregate query on the (potentially sampled) base dataset
-          agg_results = execute_aggregate_query(base_dataset, select_parts)
-          populate_stats_from_aggregates(col_stats, agg_results, column_type, effective_count)
-        rescue Sequel::DatabaseError => e # Catch errors during aggregate execution
-          if sample_modifier && e.message.match?(/tablesample|syntax error/i)
-             print_warning "  TABLESAMPLE query failed for #{column_sym}: #{e.message.lines.first.strip}. Retrying without sampling."
-             # Reset dataset to non-sampled using the correct identifier
-             base_dataset = $db[table_identifier]
-             effective_count = total_count
-             retry # Retry aggregates without sampling for this table
-          else
-            puts colored_output("  SQL Error (Aggregates) for #{column_sym}: #{e.message.lines.first.strip}", :red)
-          end
-        rescue StandardError => e
-          puts colored_output("  Error (Aggregates) for #{column_sym}: #{e.message.lines.first.strip}", :red)
-        end
+    # 2. Execute the single aggregate query (no more retry logic needed for sampling)
+    if all_select_parts.any?
+      begin
+        # Always query the base_dataset (no sampling)
+        all_agg_results = execute_aggregate_query(base_dataset, all_select_parts)
+        # Extract total count if query succeeded
+        total_count = all_agg_results[:_total_count].to_i if all_agg_results
+      rescue Sequel::DatabaseError => e
+        # Handle SQL errors if needed
+        puts colored_output("  SQL Error (Aggregates) for table #{table_name_string}: #{e.message.lines.first.strip}", :red)
+        all_agg_results = nil # Ensure results are nil on error
+      rescue StandardError => e
+        puts colored_output("  Error (Aggregates) for table #{table_name_string}: #{e.message.lines.first.strip}", :red)
+        all_agg_results = nil # Ensure results are nil on error
+      end
+    else
+       print_debug("  Skipping aggregate query for table #{table_name_string} (no parts generated)")
+    end
+
+    # 3. Populate stats from results and run frequency analysis
+    columns_schema.each do |column_sym, column_info|
+      column_type = column_info[:type]
+      # Get the pre-initialized stats
+      col_stats = initial_col_stats[column_sym]
+
+      # Print analysis message here
+      unique_marker = col_stats[:is_unique] ? ' (unique)' : ''
+      print_info "  - Analyzing column: #{column_sym} (#{col_stats[:type]}/#{col_stats[:db_type]})#{unique_marker}", :white
+
+      # Populate from the single result hash if it exists
+      if all_agg_results
+        col_stats[:count] = total_count # Set the total count for this column
+        # Pass total_count as effective_count
+        populate_stats_from_aggregates(col_stats, all_agg_results, column_type, column_sym, total_count)
       else
-        print_debug("    Skipping aggregate query for #{column_sym} (no parts generated)")
-        # Use correct base_dataset for null count fallback
-        col_stats[:null_count] = base_dataset.where(column_sym => nil).count rescue effective_count # Estimate nulls if count fails
+        # Fallback if aggregate query failed completely
+        print_debug("    Aggregate results missing for #{column_sym}, estimating null count.")
+        # Cannot reliably estimate null count without total_count
+        col_stats[:null_count] = 'N/A'
       end
 
-      # Analyze frequency on the base dataset (which includes sampling if applied)
+      # Analyze frequency (always runs on the base_dataset)
       analyze_frequency(col_stats, column_sym, base_dataset, column_type, unique_single_columns)
 
-      table_stats[column_sym.to_s] = col_stats # Store stats using string key for JSON consistency
+      # Clean up nil or empty hash values before adding to the report
+      col_stats.delete_if { |_key, value| value.nil? || value == {} }
+
+      table_stats[column_sym.to_s] = col_stats # Store fully populated stats
     end
+    # --- End Aggregate Query Refactoring ---
 
   rescue Sequel::DatabaseError => e # Catch errors like table not found at the start
     # Improve error message slightly
@@ -741,8 +809,7 @@ def analyze_table(table_name_string, sample_size)
   rescue StandardError => e
     msg = "Unexpected error analyzing table '#{table_name_string}': #{e.message}"
     puts colored_output(msg, :red)
-    puts e.backtrace.join("
-") if $debug
+    puts e.backtrace.join("\n") if $debug
     return { error: msg }
   end
 
@@ -801,17 +868,14 @@ end
 # Print the analysis summary to the console (adjusted for Sequel stats structure)
 def print_summary_report(report)
   meta = report[:metadata]
-  puts colored_output("
---- Database Analysis Summary (Sequel) ---", :magenta, :bold)
+  puts colored_output("\n--- Database Analysis Summary (Sequel) ---", :magenta, :bold)
   # Use :database_type from metadata
   puts colored_output("DB Adapter: #{meta[:database_adapter]}, Type: #{meta[:database_type]}, Version: #{meta[:database_version]}", :magenta)
   puts colored_output("Generated at: #{meta[:generated_at]}, Duration: #{meta[:analysis_duration_seconds]}s", :magenta)
-  sample_info = meta[:sample_size] ? " (Sample Size: ~#{meta[:sample_size]})" : ''
-  puts colored_output("Tables Analyzed: #{meta[:analyzed_tables].length}#{sample_info}", :magenta)
+  puts colored_output("Tables Analyzed: #{meta[:analyzed_tables].length}", :magenta)
 
   report[:tables].each do |table_name, table_data|
-    puts colored_output("
-Table: #{table_name}", :cyan, :bold)
+    puts colored_output("\nTable: #{table_name}", :cyan, :bold)
 
     if table_data.is_a?(Hash) && table_data[:error]
       puts colored_output("  Error: #{table_data[:error]}", :red)
@@ -875,7 +939,6 @@ def parse_options
     environment: DEFAULT_ENVIRONMENT,
     output_file: nil,
     tables: [],
-    sample_size: DEFAULT_SAMPLE_SIZE,
     format: DEFAULT_OUTPUT_FORMAT,
     debug: false,
     pool: DEFAULT_POOL_SIZE, # Use default pool size
@@ -903,9 +966,6 @@ def parse_options
     opts.on('-l', '--list-databases', 'List available databases and exit') { options[:list_databases] = true }
     opts.on('-o', '--output FILE', 'Output report to file instead of stdout') { |f| options[:output_file] = f }
     opts.on('-t', '--tables TBLS', Array, 'Analyze only specific tables (comma-separated)') { |t| options[:tables] = t }
-    opts.on('-s', '--sample SIZE', Integer, 'Analyze a sample of ~SIZE rows (PostgreSQL TABLESAMPLE, others may fallback)') do |s|
-      options[:sample_size] = s if s.positive?
-    end
     opts.on('-f', '--format FMT', OUTPUT_FORMATS, "Output format: #{OUTPUT_FORMATS.join('/')} (default: json)") do |f|
       options[:format] = f
     end
@@ -1135,7 +1195,6 @@ Available databases (from current connection's perspective):", :green, :bold
       database_type: $db.database_type.to_s, # Add Sequel's db type symbol
       database_version: ($db.fetch('SELECT version()').first[:version] rescue 'unknown'), # Fetch version
       analyzed_tables: tables_to_analyze, # Already sorted strings
-      sample_size: options[:sample_size],
       analysis_duration_seconds: nil
     },
     tables: {}
@@ -1143,7 +1202,7 @@ Available databases (from current connection's perspective):", :green, :bold
 
   # Analyze each table
   tables_to_analyze.each do |table_name|
-    report[:tables][table_name] = analyze_table(table_name, options[:sample_size]) # Use updated function
+    report[:tables][table_name] = analyze_table(table_name) # Use updated function
   end
 
   # Finalize and output report

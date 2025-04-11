@@ -127,26 +127,42 @@ Table: #{table_name}", :cyan, :bold)
           puts "    True %:        #{formatted[:true_percentage]}%" if formatted.key?(:true_percentage)
 
           # Print search value match if found
-          if formatted[:found] && formatted[:search_value]
-            puts colored_output("    Found Value:    '#{formatted[:search_value]}'", :green, :bold)
+          if stats[:found] && stats[:search_value]
+            puts colored_output("    Found Match:    '#{stats[:search_value]}'", :green, :bold)
           end
 
-          # Print frequency info
-          if formatted[:most_frequent]
-             puts "    Most Frequent:"
-             formatted[:most_frequent].each_with_index do |(v, c), i|
-                prefix = i == 0 ? "      - " : "        "
-                # Use truncate_value for display
-                puts "#{prefix}#{truncate_value(v)} (#{c})"
-             end
+          # Print most frequent value if present
+          if formatted[:most_frequent]&.any?
+            top_val, top_count = formatted[:most_frequent].first
+            puts "    Most Frequent: #{truncate_value(top_val)} (#{top_count} times)"
           end
-          if formatted[:least_frequent]
-             puts "    Least Frequent:"
-             formatted[:least_frequent].each_with_index do |(v, c), i|
-                prefix = i == 0 ? "      - " : "        "
-                puts "#{prefix}#{truncate_value(v)} (#{c})"
-             end
+        end
+      end
+
+      # Add search summary at the end of the report
+      if meta[:search_value]
+        total_found = 0
+        found_locations = []
+
+        report_data[:tables].each do |table_name, table_data|
+          next unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
+
+          table_data.each do |column_name, stats|
+            if stats[:found] && stats[:search_value]
+              total_found += 1
+              found_locations << "#{table_name}.#{column_name}"
+            end
           end
+        end
+
+        if total_found > 0
+          puts colored_output("\nSearch Summary", :green, :bold)
+          puts colored_output("Value '#{meta[:search_value]}' found in #{total_found} column(s):", :green)
+          found_locations.each do |location|
+            puts colored_output("  - #{location}", :green)
+          end
+        else
+          puts colored_output("\nValue '#{meta[:search_value]}' not found in any column", :yellow)
         end
       end
     end
@@ -240,6 +256,35 @@ Table: #{table_name}", :cyan, :bold)
              top_val, top_count = formatted[:most_frequent].first
              puts "    - Most Frequent: #{truncate_value(top_val, 40)} (#{top_count})"
           end
+        end
+      end
+
+      # Add search summary at the end of the report
+      if meta[:search_value]
+        total_found = 0
+        found_locations = []
+
+        report_data[:tables].each do |table_name, table_data|
+          next unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
+
+          table_data.each do |column_name, stats|
+            if stats[:found] && stats[:search_value]
+              total_found += 1
+              found_locations << "#{table_name}.#{column_name}"
+            end
+          end
+        end
+
+        puts "\n## Search Summary"
+        if total_found > 0
+          puts "- **Value:** '#{meta[:search_value]}'"
+          puts "- **Found In:** #{total_found} column(s)"
+          puts "- **Locations:**"
+          found_locations.each do |location|
+            puts "  - #{location}"
+          end
+        else
+          puts "- Value '#{meta[:search_value]}' not found in any column"
         end
       end
     end
@@ -444,6 +489,33 @@ Table: #{table_name}", :cyan, :bold)
     def write_json(output_file)
       # Use make_json_safe from Utils module
       report_for_json = make_json_safe(report_data)
+
+      # Add search summary to JSON if search value was provided
+      meta = report_data[:metadata]
+      if meta[:search_value]
+        search_summary = {
+          search_value: meta[:search_value],
+          total_found: 0,
+          found_locations: []
+        }
+
+        report_data[:tables].each do |table_name, table_data|
+          next unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
+
+          table_data.each do |column_name, stats|
+            if stats[:found] && stats[:search_value]
+              search_summary[:total_found] += 1
+              search_summary[:found_locations] << "#{table_name}.#{column_name}"
+            end
+          end
+        end
+
+        # Add search_summary to the report data
+        report_for_json["search_summary"] = search_summary
+      end
+
+      # Use a default output file if none provided
+      output_file ||= File.join(Dir.pwd, "db_report_#{Time.now.strftime('%Y%m%d_%H%M%S')}.json")
 
       # Ensure the directory exists
       dir = File.dirname(output_file)

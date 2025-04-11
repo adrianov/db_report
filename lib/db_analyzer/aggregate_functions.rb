@@ -51,6 +51,9 @@ module DbReport
                       Sequel.function(:MAX, Sequel.function(:array_length, column_sym, 1)).as(max_alias)]
             min_max_added = true
           end
+        when :tsvector
+          # Skip MIN/MAX for tsvector type
+          min_max_added = true
         end
         # Default MIN/MAX for other types if not handled above
         unless min_max_added || !groupable # Don't add MIN/MAX for non-groupable types like text/blob unless handled above

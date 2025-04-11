@@ -67,7 +67,8 @@ class DbReportApp
       list_databases: false,
       connect_timeout: DbReport::Utils::DEFAULT_CONNECT_TIMEOUT,
       parallel: true,
-      parallel_processes: nil
+      parallel_processes: nil,
+      search_value: nil
     }
 
     parser = OptionParser.new do |opts|
@@ -98,6 +99,9 @@ class DbReportApp
       end
       opts.on('--parallel-processes NUM', Integer, "Number of parallel processes to use for table analysis (default: auto-detect)") do |n|
         options[:parallel_processes] = n if n.positive?
+      end
+      opts.on('-s', '--search-value VALUE', 'Search for specific value in all tables and columns') do |v|
+        options[:search_value] = v
       end
       opts.on('--debug', 'Show detailed debug information and SQL logging') { options[:debug] = true }
       opts.on('-h', '--help', 'Show this help message') { puts opts; exit }
@@ -245,21 +249,26 @@ Available databases (from current connection's perspective):", :green, :bold
 
   # Helper method to create the basic report structure
   def generate_report_structure(db_connection, tables_to_analyze)
+    metadata = {
+      generated_at: Time.now.iso8601,
+      database_adapter: db_connection.adapter_scheme.to_s,
+      database_type: db_connection.database_type.to_s,
+      # Safely fetch version
+      database_version: begin
+                          db_connection.fetch('SELECT version()').first[:version]
+                        rescue StandardError
+                          'unknown'
+                        end,
+      analyzed_tables: tables_to_analyze, # List of tables included in the report
+      analysis_duration_seconds: nil, # Placeholder
+      parallel_processing: false # Default, will be updated if parallel mode used
+    }
+
+    # Add search_value to metadata if provided
+    metadata[:search_value] = options[:search_value] if options[:search_value]
+
     {
-      metadata: {
-        generated_at: Time.now.iso8601,
-        database_adapter: db_connection.adapter_scheme.to_s,
-        database_type: db_connection.database_type.to_s,
-        # Safely fetch version
-        database_version: begin
-                            db_connection.fetch('SELECT version()').first[:version]
-                          rescue StandardError
-                            'unknown'
-                          end,
-        analyzed_tables: tables_to_analyze, # List of tables included in the report
-        analysis_duration_seconds: nil, # Placeholder
-        parallel_processing: false # Default, will be updated if parallel mode used
-      },
+      metadata: metadata,
       tables: {} # Placeholder for table-specific analysis results
     }
   end

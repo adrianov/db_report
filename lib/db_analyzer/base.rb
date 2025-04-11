@@ -73,6 +73,12 @@ module DbReport
           print_debug "  Batch analyzing column frequencies..." if debug
           batch_analyze_frequencies(initial_col_stats, base_dataset, columns_schema, unique_single_columns)
 
+          # Search for specific value if provided in options
+          if options[:search_value]
+            print_debug "  Searching for value: #{options[:search_value]}..." if debug
+            search_for_value_in_table(table_name_string, columns_schema, options[:search_value], initial_col_stats)
+          end
+
           # Clean up and store final stats
           columns_schema.each do |column_sym, _column_info|
             col_stats = initial_col_stats[column_sym]
@@ -92,6 +98,78 @@ module DbReport
         end
 
         table_stats
+      end
+
+      # Search for a specific value in a given table and its columns
+      # @param table_name [String] Name of the table to search in
+      # @param columns_schema [Hash] Schema information about columns
+      # @param search_value [String] Value to search for
+      # @param col_stats [Hash] Column statistics to update with search results
+      def search_for_value_in_table(table_name, columns_schema, search_value, col_stats)
+        table_identifier = create_sequel_identifier(table_name)
+
+        columns_schema.each do |column_sym, column_info|
+          begin
+            # Create a safe query to search for the value
+            dataset = db[table_identifier]
+
+            # Different search strategies based on column type
+            case column_info[:type]
+            when :integer, :bigint
+              # Try to convert value to integer if the column type is integer
+              begin
+                int_value = Integer(search_value)
+                result = dataset.where(column_sym => int_value).count > 0
+              rescue ArgumentError
+                # If search_value can't be converted to integer, no match
+                result = false
+              end
+            when :float, :decimal, :numeric
+              # Try to convert value to float if the column type is float/decimal
+              begin
+                float_value = Float(search_value)
+                result = dataset.where(column_sym => float_value).count > 0
+              rescue ArgumentError
+                result = false
+              end
+            when :boolean
+              # Handle boolean values
+              bool_value = case search_value.downcase
+                          when 'true', 't', 'yes', 'y', '1'
+                            true
+                          when 'false', 'f', 'no', 'n', '0'
+                            false
+                          else
+                            nil
+                          end
+              result = !bool_value.nil? && dataset.where(column_sym => bool_value).count > 0
+            when :date, :datetime, :timestamp
+              # Skip date/time types for simple string searches
+              result = false
+            when :json, :jsonb
+              # For JSON types, use database-specific containment operators if available
+              if db.database_type == :postgres
+                # Postgres JSON containment check (works with both text and non-text values)
+                result = dataset.where(Sequel.lit("#{db.literal(column_sym)}::text ILIKE ?", "%#{search_value}%")).count > 0
+              else
+                # Fallback to string representation for other databases
+                result = dataset.where(Sequel.like(Sequel.function(:cast, column_sym, :text), "%#{search_value}%")).count > 0
+              end
+            else
+              # Default string-based search for other types
+              result = dataset.where(Sequel.like(column_sym.to_sym, "%#{search_value}%")).count > 0
+            end
+
+            # Add search result to column stats
+            if result
+              col_stats[column_sym][:found] = true
+              col_stats[column_sym][:search_value] = search_value
+              print_info "    Found '#{search_value}' in column: #{column_sym}", :green
+            end
+          rescue Sequel::DatabaseError => e
+            print_debug "    Error searching for value in #{table_name}.#{column_sym}: #{e.message}" if debug
+          end
+        end
       end
 
       # Analyze tables in parallel using multiple processes (default method)

@@ -12,6 +12,7 @@ A Ruby utility for analyzing database structure and generating detailed statisti
   - Most frequent and least frequent values (for applicable types)
   - Distinct value count (for applicable types)
   - Type-specific metrics (array lengths, boolean distributions, etc.)
+- Search capability to find specific values across tables and columns
 - Works with PostgreSQL, MySQL, and SQLite (via Sequel adapters). **Note:** Currently, thorough testing has primarily focused on PostgreSQL.
 - Output as JSON or a human-readable summary format
 - Debugging mode with detailed SQL logging
@@ -47,6 +48,7 @@ ruby db_report.rb [options]
 -t, --tables TBL1,TBL2,...       Analyze only specific tables (comma-separated, use schema.table if needed)
 -f, --format FMT                 Output format: json/summary (default: json)
 -p, --pool SIZE                  Max connections pool size (default: 5)
+-s, --search VALUE               Search for a specific value across all tables or specified tables
 --timeout SECS                   Database connection timeout (default: 10)
 --parallel                       Use parallel processing for analyzing tables
 --parallel-processes NUM         Number of parallel processes to use (default: auto-detect)
@@ -96,6 +98,16 @@ Enable debug logging:
 ruby db_report.rb --debug
 ```
 
+Search for a specific value across all tables:
+```bash
+ruby db_report.rb --search "Freund"
+```
+
+Search for a value in specific tables:
+```bash
+ruby db_report.rb --search "Freund" --tables words,translations
+```
+
 ### Database Connection
 
 The script determines the database connection configuration using the following priority:
@@ -120,6 +132,51 @@ The `--parallel` option enables parallel processing of tables, which can signifi
 - The `parallel` gem is required for this feature. It's included in the Gemfile.
 
 **Note:** When using parallel processing, the total number of database connections can be high (processes × pool size). Adjust your database server's connection limit accordingly.
+
+### Search Feature
+
+The search feature allows you to find specific values within your database tables and columns. This is useful for locating where certain data is stored or to verify the existence of specific values.
+
+#### Usage
+
+```bash
+ruby db_report.rb -s, --search VALUE [options]
+```
+
+The search feature can be combined with other options to narrow down the scope:
+
+```bash
+ruby db_report.rb --search "Freund" --tables words
+```
+
+#### Example Output
+
+When a search is performed, the tool will output a summary of where the value was found:
+
+```
+Table: words (Rows: 6)
+Column           Type                          Nulls (%)   Distinct   Stats                                                                                     Found
+id               uuid                          0 (0.0%)               Min: 29cc3963-690..., Max: ca114a89-e07..., AvgLen: 36.0
+word             character varying             0 (0.0%)    6          Min: Freund, Max: мир, AvgLen: 4.8, MostFreq: Freund (1)                                  YES
+language         character varying             0 (0.0%)    6          Min: de, Max: ru, AvgLen: 2.0, MostFreq: NULL (1)
+translations     text[]                        0 (0.0%)               Min: 3, Max: 10, AvgItems: 4.2
+transcription    character varying             0 (0.0%)    6          Min: a.ˈmoɾ, Max: ˈka.za, AvgLen: 5.8, MostFreq: NULL (1)
+etymology        text                          0 (0.0%)    6          Min: From Latin a..., Max: Old English hāl, AvgLen: 24.3, MostFreq: From Latin a... (1)
+synonyms         text[]                        0 (0.0%)               Min: 2, Max: 3, AvgItems: 2.7
+antonyms         text[]                        0 (0.0%)               Min: 1, Max: 2, AvgItems: 1.8
+examples         text[]                        0 (0.0%)               Min: 1, Max: 3, AvgItems: 2.7
+relatedPhrases   text[]                        0 (0.0%)               Min: 1, Max: 2, AvgItems: 1.8
+isActive         boolean                       0 (0.0%)    1          Min: 1, Max: 1, True%: 100.0, MostFreq: true (6)
+createdAt        timestamp without time zone   0 (0.0%)    6          Min: 2025-04-05T0..., Max: 2025-04-05T0..., MostFreq: 2025-04-05 0... (1)
+updatedAt        timestamp without time zone   0 (0.0%)    6          Min: 2025-04-05T0..., Max: 2025-04-05T0..., MostFreq: NULL (1)
+
+
+Search Summary
+Value 'Freund' found in 1 column(s):
+  - words.word
+```
+
+The `Found` column in the output indicates which columns contain the search value, and a summary is provided at the end showing all matches.
 
 ## Output Example (JSON)
 

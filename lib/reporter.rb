@@ -50,6 +50,12 @@ module DbReport
       formatted_stats[:most_frequent] = stats[:most_frequent] if stats[:most_frequent]&.any?
       formatted_stats[:least_frequent] = stats[:least_frequent] if stats[:least_frequent]&.any?
 
+      # Add search value findings
+      if stats[:found] && stats[:search_value]
+        formatted_stats[:found] = true
+        formatted_stats[:search_value] = stats[:search_value]
+      end
+
       formatted_stats
     end
 
@@ -62,17 +68,22 @@ module DbReport
       puts colored_output("Generated: #{meta[:generated_at]}, Duration: #{meta[:analysis_duration_seconds]}s", :magenta)
       puts colored_output("Tables Analyzed: #{meta[:analyzed_tables].length}", :magenta)
 
+      # Display search value if it was used
+      if meta[:search_value]
+        puts colored_output("Search Value: #{meta[:search_value]}", :magenta, :bold)
+      end
+
       report_data[:tables].each do |table_name, table_data|
         puts colored_output("
 Table: #{table_name}", :cyan, :bold)
 
         if table_data.is_a?(Hash) && table_data[:error]
-          puts colored_output("  Error: #{table_data[:error]}", :red)
+          puts colored_output("Table: #{table_name} - Error: #{table_data[:error]}", :red)
           next
         end
 
         unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
-           puts colored_output("  Skipping malformed data for table: #{table_name}", :yellow)
+           puts colored_output("Table: #{table_name} - Skipping malformed data", :yellow)
            next
         end
 
@@ -86,7 +97,8 @@ Table: #{table_name}", :cyan, :bold)
           next unless stats.is_a?(Hash) # Ensure stats is a hash
 
           unique_marker = stats[:is_unique] ? colored_output(' (unique)', :light_blue) : ''
-          puts colored_output("  - #{column_name}#{unique_marker}", :yellow)
+          found_marker = stats[:found] ? colored_output(' [FOUND]', :green, :bold) : ''
+          puts colored_output("  - #{column_name}#{unique_marker}#{found_marker}", :yellow)
 
           type_part = stats[:type].to_s
           db_type_part = stats[:db_type].to_s
@@ -113,7 +125,11 @@ Table: #{table_name}", :cyan, :bold)
           puts "    Avg Length:    #{formatted[:avg_length]}" if formatted.key?(:avg_length)
           puts "    Avg Items:     #{formatted[:avg_items]}" if formatted.key?(:avg_items)
           puts "    True %:        #{formatted[:true_percentage]}%" if formatted.key?(:true_percentage)
-          puts "    Distinct:      #{stats[:distinct_count]}" if stats[:distinct_count] && stats[:distinct_count].to_i > 0
+
+          # Print search value match if found
+          if formatted[:found] && formatted[:search_value]
+            puts colored_output("    Found Value:    '#{formatted[:search_value]}'", :green, :bold)
+          end
 
           # Print frequency info
           if formatted[:most_frequent]
@@ -147,6 +163,11 @@ Table: #{table_name}", :cyan, :bold)
       puts "- **Duration:** #{meta[:analysis_duration_seconds]}s"
       puts "- **Tables Analyzed:** #{meta[:analyzed_tables].length}"
 
+      # Display search value if it was used
+      if meta[:search_value]
+        puts "- **Search Value:** #{meta[:search_value]}"
+      end
+
       report_data[:tables].each do |table_name, table_data|
         puts "\n## Table: #{table_name}"
 
@@ -179,7 +200,8 @@ Table: #{table_name}", :cyan, :bold)
                        "#{type_part} / #{db_type_part}"
                      end
 
-          puts "- **`#{column_name}`**"
+          found_marker = stats[:found] ? " [FOUND]" : ""
+          puts "- **`#{column_name}`**#{found_marker}"
           puts "    - Type: #{type_str}"
 
           null_count = stats[:null_count].to_i
@@ -195,6 +217,11 @@ Table: #{table_name}", :cyan, :bold)
             puts "    - Distinct Values: #{stats[:distinct_count]} #{stats[:is_unique] ? '(Unique)' : ''}"
           elsif stats[:is_unique]
              puts "    - Distinct Values: (Unique - count matches rows)"
+          end
+
+          # Include search value finding in the report
+          if stats[:found] && stats[:search_value]
+            puts "    - **Search Value Found:** '#{stats[:search_value]}'"
           end
 
           # Add simplified stats based on type (more concise for GPT)
@@ -223,12 +250,12 @@ Table: #{table_name}", :cyan, :bold)
       meta = report_data[:metadata]
 
       # Print title manually before the table
-      puts colored_output(" Database Analysis Summary", :magenta, :bold)
+      puts colored_output("Database Analysis Summary", :magenta, :bold)
 
       # Print Metadata Table - no borders and left-aligned
       metadata_table = Terminal::Table.new do |t|
         t.headings = ['Parameter', 'Value']
-        t.rows = [
+        rows = [
           ['Adapter', meta[:database_adapter]],
           ['Type', meta[:database_type]],
           ['Version', meta[:database_version]],
@@ -236,6 +263,11 @@ Table: #{table_name}", :cyan, :bold)
           ['Duration', "#{meta[:analysis_duration_seconds]}s"],
           ['Tables Analyzed', meta[:analyzed_tables].length]
         ]
+
+        # Add search value to metadata table if present
+        rows << ['Search Value', meta[:search_value]] if meta[:search_value]
+
+        t.rows = rows
         t.style = {
           border_x: "",
           border_y: " ",
@@ -257,6 +289,8 @@ Table: #{table_name}", :cyan, :bold)
         next if i == 1 && (line.include?('─') || line.include?('-') || line.strip.empty?)
         # Skip empty or space-only lines
         next if line.strip.empty?
+        # Remove leading space that forms the left border
+        line = line.sub(/^ /, '')
         cleaned_lines << line
       end
 
@@ -268,13 +302,13 @@ Table: #{table_name}", :cyan, :bold)
         puts # Add space before each table
 
         if table_data.is_a?(Hash) && table_data[:error]
-          puts colored_output(" Table: #{table_name} - Error: #{table_data[:error]}", :red)
+          puts colored_output("Table: #{table_name} - Error: #{table_data[:error]}", :red)
           next
         end
 
         unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
-           puts colored_output(" Table: #{table_name} - Skipping malformed data", :yellow)
-           next
+            puts colored_output("Table: #{table_name} - Skipping malformed data", :yellow)
+            next
         end
 
         first_col_stats = table_data.values.first || {}
@@ -282,7 +316,7 @@ Table: #{table_name}", :cyan, :bold)
 
         # Prepare data before creating the table
         all_rows_data = []
-        initial_headers = ['Column', 'Type', 'Nulls (%)', 'Distinct', 'Min', 'Max', 'Average/AvgLen', 'Most Frequent']
+        initial_headers = ['Column', 'Type', 'Nulls (%)', 'Distinct', 'Stats', 'Found']
 
         table_data.each do |column_name, stats|
           next unless stats.is_a?(Hash)
@@ -294,25 +328,26 @@ Table: #{table_name}", :cyan, :bold)
           distinct_str = stats[:distinct_count] ? "#{stats[:distinct_count]}#{stats[:is_unique] ? ' (U)' : ''}" : ''
 
           formatted = format_stats_for_summary(stats)
-          min_val = formatted[:min].nil? ? '' : truncate_value(formatted[:min], 25)
-          max_val = formatted[:max].nil? ? '' : truncate_value(formatted[:max], 25)
-          avg_val = if formatted.key?(:average)
-                      formatted[:average].to_s # Ensure string for emptiness check
-                    elsif formatted.key?(:avg_length)
-                      formatted[:avg_length].to_s
-                    elsif formatted.key?(:true_percentage)
-                      "#{formatted[:true_percentage]}% True"
-                    elsif formatted.key?(:avg_items)
-                      formatted[:avg_items].to_s
-                    else
-                      ''
-                    end
 
-          most_freq_str = ''
+          # Create combined stats string
+          stats_parts = []
+          stats_parts << "Min: #{truncate_value(formatted[:min], 15)}" if formatted[:min]
+          stats_parts << "Max: #{truncate_value(formatted[:max], 15)}" if formatted[:max]
+          stats_parts << "Avg: #{formatted[:average]}" if formatted[:average]
+          stats_parts << "AvgLen: #{formatted[:avg_length]}" if formatted[:avg_length]
+          stats_parts << "True%: #{formatted[:true_percentage]}" if formatted[:true_percentage]
+          stats_parts << "AvgItems: #{formatted[:avg_items]}" if formatted[:avg_items]
+
+          # Add most frequent to stats if available
           if formatted[:most_frequent]&.any?
             top_val, top_count = formatted[:most_frequent].first
-            most_freq_str = "#{truncate_value(top_val, 25)} (#{top_count})"
+            stats_parts << "MostFreq: #{truncate_value(top_val, 15)} (#{top_count})"
           end
+
+          stats_str = stats_parts.join(", ")
+
+          # Add found value column
+          found_str = formatted[:found] ? colored_output("YES", :green, :bold) : ''
 
           # Collect row data (raw values before colorization where possible for checks)
           all_rows_data << [
@@ -320,10 +355,8 @@ Table: #{table_name}", :cyan, :bold)
             type_str,
             null_perc_str,
             distinct_str,
-            min_val,
-            max_val,
-            avg_val,
-            most_freq_str
+            stats_str,
+            found_str
           ]
         end
 
@@ -344,7 +377,7 @@ Table: #{table_name}", :cyan, :bold)
         end
 
         # Print table title manually
-        puts " " + colored_output("Table: #{table_name} (Rows: #{row_count})", :cyan, :bold)
+        puts colored_output("Table: #{table_name} (Rows: #{row_count})", :cyan, :bold)
 
         # Build table with filtered data
         table_summary = Terminal::Table.new do |t|
@@ -371,31 +404,57 @@ Table: #{table_name}", :cyan, :bold)
           next if i == 1 && (line.include?('─') || line.include?('-') || line.strip.empty?)
           # Skip empty or space-only lines
           next if line.strip.empty?
+          # Remove leading space that forms the left border
+          line = line.sub(/^ /, '')
           cleaned_lines << line
         end
 
         puts cleaned_lines.join("\n")
         puts # Add extra line after each table
       end
+
+      # Add footer with any search findings summary
+      if meta[:search_value]
+        total_found = 0
+        found_locations = []
+
+        report_data[:tables].each do |table_name, table_data|
+          next unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
+
+          table_data.each do |column_name, stats|
+            if stats[:found] && stats[:search_value]
+              total_found += 1
+              found_locations << "#{table_name}.#{column_name}"
+            end
+          end
+        end
+
+        if total_found > 0
+          puts colored_output("\nSearch Summary", :green, :bold)
+          puts colored_output("Value '#{meta[:search_value]}' found in #{total_found} column(s):", :green)
+          found_locations.each do |location|
+            puts colored_output("  - #{location}", :green)
+          end
+        else
+          puts colored_output("\nValue '#{meta[:search_value]}' not found in any column", :yellow)
+        end
+      end
     end
 
-    # Write the JSON report to a file or stdout
     def write_json(output_file)
       # Use make_json_safe from Utils module
       report_for_json = make_json_safe(report_data)
-      json_report = JSON.pretty_generate(report_for_json)
 
-      if output_file
-        begin
-          FileUtils.mkdir_p(File.dirname(output_file))
-          File.write(output_file, json_report)
-          print_info "Report successfully written to #{output_file}"
-        rescue StandardError => e
-          print_warning "Error writing report to file #{output_file}: #{e.message}"
-        end
-      else
-        puts json_report
+      # Ensure the directory exists
+      dir = File.dirname(output_file)
+      FileUtils.mkdir_p(dir) unless File.directory?(dir)
+
+      # Write the JSON file
+      File.open(output_file, 'w') do |file|
+        file.write(JSON.pretty_generate(report_for_json))
       end
+
+      puts colored_output("Report written to #{output_file}", :green)
     end
   end
 end

@@ -222,11 +222,12 @@ Table: #{table_name}", :cyan, :bold)
       require 'terminal-table' # Ensure it's loaded
       meta = report_data[:metadata]
 
-      # Print Metadata Table
+      # Print title manually before the table
+      puts colored_output(" Database Analysis Summary", :magenta, :bold)
+
+      # Print Metadata Table - no borders and left-aligned
       metadata_table = Terminal::Table.new do |t|
-        t.title = colored_output("Database Analysis Summary", :magenta, :bold)
         t.headings = ['Parameter', 'Value']
-        t.style = { border_x: "-", border_y: "|", border_i: "+" }
         t.rows = [
           ['Adapter', meta[:database_adapter]],
           ['Type', meta[:database_type]],
@@ -235,20 +236,44 @@ Table: #{table_name}", :cyan, :bold)
           ['Duration', "#{meta[:analysis_duration_seconds]}s"],
           ['Tables Analyzed', meta[:analyzed_tables].length]
         ]
+        t.style = {
+          border_x: "",
+          border_y: " ",
+          border_i: " ",
+          border_top: false,
+          border_bottom: false,
+          border_left: false,
+          border_right: false
+        }
       end
-      puts metadata_table
+
+      # Modify the rendering to remove heading separator line and extra empty lines
+      rendered_table = metadata_table.to_s.split("\n")
+      cleaned_lines = []
+
+      # Process each line
+      rendered_table.each_with_index do |line, i|
+        # Skip separator line (usually the second line in the rendered table)
+        next if i == 1 && (line.include?('─') || line.include?('-') || line.strip.empty?)
+        # Skip empty or space-only lines
+        next if line.strip.empty?
+        cleaned_lines << line
+      end
+
+      puts cleaned_lines.join("\n")
+      puts # Add space after metadata table
 
       # Print Table Summaries
       report_data[:tables].each do |table_name, table_data|
         puts # Add space before each table
 
         if table_data.is_a?(Hash) && table_data[:error]
-          puts colored_output("Table: #{table_name} - Error: #{table_data[:error]}", :red)
+          puts colored_output(" Table: #{table_name} - Error: #{table_data[:error]}", :red)
           next
         end
 
         unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
-           puts colored_output("Table: #{table_name} - Skipping malformed data", :yellow)
+           puts colored_output(" Table: #{table_name} - Skipping malformed data", :yellow)
            next
         end
 
@@ -318,14 +343,39 @@ Table: #{table_name}", :cyan, :bold)
           row.reject.with_index { |_, index| empty_column_indices.include?(index) }
         end
 
-        # Build and print the table with filtered data
+        # Print table title manually
+        puts " " + colored_output("Table: #{table_name} (Rows: #{row_count})", :cyan, :bold)
+
+        # Build table with filtered data
         table_summary = Terminal::Table.new do |t|
-          t.title = colored_output("Table: #{table_name} (Rows: #{row_count})", :cyan, :bold)
           t.headings = filtered_headers
           t.rows = filtered_rows
-          t.style = { border_x: "-", border_y: "|", border_i: "+" }
+          t.style = {
+            border_x: "",
+            border_y: " ",
+            border_i: " ",
+            border_top: false,
+            border_bottom: false,
+            border_left: false,
+            border_right: false
+          }
         end
-        puts table_summary
+
+        # Modify the rendering to remove heading separator line and empty lines
+        rendered_table = table_summary.to_s.split("\n")
+        cleaned_lines = []
+
+        # Process each line
+        rendered_table.each_with_index do |line, i|
+          # Skip separator line (usually the second line in the rendered table)
+          next if i == 1 && (line.include?('─') || line.include?('-') || line.strip.empty?)
+          # Skip empty or space-only lines
+          next if line.strip.empty?
+          cleaned_lines << line
+        end
+
+        puts cleaned_lines.join("\n")
+        puts # Add extra line after each table
       end
     end
 

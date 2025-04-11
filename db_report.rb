@@ -12,6 +12,7 @@ require 'sequel'
 require 'optparse'
 require 'time'
 require 'set'
+require 'fileutils'
 
 # --- Local Application Code ---
 # Use relative paths from the script's directory
@@ -263,9 +264,30 @@ Analysis finished in #{duration} seconds.", :green, :bold
     # Create reporter and output based on format
     @reporter = DbReport::Reporter.new(report_data)
     case options[:format]
-    when 'summary' then reporter.print_summary
+    when 'summary', 'gpt'
+      output_target = options[:output_file]
+      if output_target
+        begin
+          # Ensure the directory exists before writing
+          FileUtils.mkdir_p(File.dirname(output_target))
+          File.open(output_target, 'w') do |file|
+            original_stdout = $stdout
+            $stdout = file # Temporarily redirect stdout
+            options[:format] == 'summary' ? reporter.print_summary : reporter.print_gpt_summary
+          ensure
+            $stdout = original_stdout # Ensure stdout is restored
+          end
+          # Use existing helper, assumes print_info goes to original stdout/stderr managed elsewhere or is acceptable here
+          print_info "Report successfully written to #{output_target}"
+        rescue StandardError => e
+          # Use existing helper for warnings
+          print_warning "Error writing report to file #{output_target}: #{e.message}"
+        end
+      else
+        # Original behavior: print directly to current stdout
+        options[:format] == 'summary' ? reporter.print_summary : reporter.print_gpt_summary
+      end
     when 'json' then reporter.write_json(options[:output_file])
-    when 'gpt' then reporter.print_gpt_summary
     # Add other formats here if needed
     end
   end

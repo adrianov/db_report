@@ -17,7 +17,8 @@ module DbReport
   module Utils
     # Helper method for colored console output
     def colored_output(text, color = :default, mode = nil)
-      return text unless HAS_COLORIZE
+      # Only colorize if the gem is available AND output is a TTY
+      return text unless HAS_COLORIZE && $stdout.tty?
 
       text = text.colorize(color)
       text = text.send(mode) if mode

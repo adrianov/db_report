@@ -490,9 +490,18 @@ def execute_aggregate_query(dataset, select_expressions)
 end
 
 # Helper to safely run frequency queries using Sequel datasets
-def execute_frequency_query(dataset, column_sym)
-  # Use group_and_count for frequency
-  freq_dataset = dataset.group_and_count(column_sym)
+def execute_frequency_query(base_dataset, column_sym, order_expressions, limit_count)
+  # --- Added Debugging ---
+  if $debug
+    puts colored_output("    [Debug Frequency] Column: #{column_sym}, Order: #{order_expressions.inspect}, Limit: #{limit_count.inspect}", :magenta)
+  end
+  # --- End Added Debugging ---
+
+  # Construct the frequency query: group -> order -> limit
+  # Handle nil limit correctly (Sequel might treat limit(nil) as no limit)
+  freq_dataset = base_dataset.group_and_count(column_sym).order(*order_expressions)
+  freq_dataset = freq_dataset.limit(limit_count) if limit_count
+
   sql_query = freq_dataset.sql
   print_debug("  Executing Frequency: #{sql_query}") if $debug
 
@@ -642,11 +651,21 @@ end
 # Fetch and store most and least frequent values using Sequel datasets
 def analyze_frequency(col_stats, column_sym, base_dataset, column_type, unique_single_columns)
   # Skip frequency analysis if:
-  # - Column is not groupable (text, blob, json, etc.)
-  # - Column is known unique (is_unique flag or from index check)
-  # - Column is likely a PK/FK (name is 'id' or ends with '_id')
-  groupable = !%i[text blob json jsonb xml array hstore].include?(column_type)
+  # - Column is not groupable (text, blob, xml, array, hstore) - JSON/JSONB are handled
+  # - Column is known unique
+  # - Column is likely a PK/FK
+  groupable = !%i[text blob xml array hstore].include?(column_type)
   is_pk_or_fk = col_stats[:is_unique] || unique_single_columns.include?(column_sym) || column_sym == :id || column_sym.to_s.end_with?('_id')
+  # Robust check for JSON types (handles symbols and strings)
+  is_json_type = column_type.to_s.include?('json')
+
+  # --- Added Debugging for type check ---
+  if $debug && is_json_type
+    puts colored_output("    [Debug JSON Check] Column: #{column_sym}, Type: #{column_type.inspect}, Detected as JSON.", :magenta)
+  elsif $debug
+    puts colored_output("    [Debug JSON Check] Column: #{column_sym}, Type: #{column_type.inspect}, NOT detected as JSON.", :magenta)
+  end
+  # --- End Debugging ---
 
   unless groupable
     print_debug("    Skipping frequency analysis for non-groupable type: #{column_sym} (#{column_type})") if $debug
@@ -658,33 +677,44 @@ def analyze_frequency(col_stats, column_sym, base_dataset, column_type, unique_s
     return
   end
 
-  # Continue only if column is groupable and not a PK/FK/Unique
   return unless col_stats[:count] > 0
 
-  # Base dataset for frequency - REMOVED redundant IS NOT NULL clause
-  freq_dataset = base_dataset # No longer need .where { Sequel.~(column_sym => nil) }
+  # Define ordering based on type
+  most_freq_order = if is_json_type
+                      [Sequel.desc(:count)] # Order only by count for JSON
+                    else
+                      [Sequel.desc(:count), column_sym] # Original order
+                    end
+  least_freq_order = if is_json_type
+                       [Sequel.asc(:count)] # Order only by count for JSON
+                     else
+                       [Sequel.asc(:count), column_sym] # Original order
+                     end
 
   # Most Frequent
-  # Group by implicitly handles NULLs, count(*) counts non-null occurrences per group
-  most_freq_results = execute_frequency_query(freq_dataset.order(Sequel.desc(:count), column_sym).limit(5), column_sym)
+  # Pass base_dataset, column, order, and limit to the refactored function
+  most_freq_results = execute_frequency_query(base_dataset, column_sym, most_freq_order, 5)
   col_stats[:most_frequent] = most_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
 
   # Least Frequent (only if worthwhile)
   distinct_count = col_stats[:distinct_count] || 0
 
   if distinct_count > 5
-    # Group by implicitly handles NULLs
-    least_freq_results = execute_frequency_query(freq_dataset.order(Sequel.asc(:count), column_sym).limit(5), column_sym)
+    # Pass base_dataset, column, order, and limit
+    least_freq_results = execute_frequency_query(base_dataset, column_sym, least_freq_order, 5)
     col_stats[:least_frequent] = least_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
   elsif distinct_count > 0 && distinct_count <= 5 && col_stats[:most_frequent].empty?
-    all_freq_results = execute_frequency_query(freq_dataset.order(Sequel.asc(:count), column_sym), column_sym)
+    # Fetch all distinct values if <= 5 and most_frequent wasn't populated (no limit needed, use least order)
+    # Pass nil as limit to fetch all
+    all_freq_results = execute_frequency_query(base_dataset, column_sym, least_freq_order, nil)
     col_stats[:most_frequent] = all_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
   end
 
 rescue Sequel::DatabaseError => e
-  # ... error handling ...
+  puts colored_output("  SQL Frequency Error for column #{column_sym}: #{e.message.lines.first.strip}", :red)
 rescue StandardError => e
-  # ... error handling ...
+  puts colored_output("  Error during frequency analysis for column #{column_sym}: #{e.message}", :red)
+  puts e.backtrace.join("\n") if $debug
 end
 
 # Analyze a single table using Sequel (needs to handle qualified names)
@@ -791,6 +821,12 @@ def analyze_table(table_name_string)
         col_stats[:null_count] = 'N/A'
       end
 
+      # --- Added Debugging ---
+      if $debug && table_name_string == 'datasources' && column_sym == :information_schema
+        puts colored_output("    [Debug Type Check] Table: #{table_name_string}, Column: #{column_sym}, Detected Type: #{column_type.inspect}", :magenta)
+      end
+      # --- End Added Debugging ---
+
       # Analyze frequency (always runs on the base_dataset)
       analyze_frequency(col_stats, column_sym, base_dataset, column_type, unique_single_columns)
 
@@ -834,44 +870,47 @@ end
 
 # Format stats for summary output (uses :type symbol from Sequel schema)
 def format_stats_for_summary(stats)
-  parts = []
+  # Return a hash of formatted stats instead of a string
+  formatted_stats = {}
   type = stats[:type].to_sym rescue nil # Type from col_stats
+
+  # Common stats
+  formatted_stats[:min] = stats[:min] unless stats[:min].nil?
+  formatted_stats[:max] = stats[:max] unless stats[:max].nil?
 
   # Use abstracted Sequel types
   case type
   when :string, :text, :json, :jsonb, :xml, :blob, :enum, :uuid, :inet # Group string-like/complex types
-     # Use avg length if available (key is :avg)
-     if stats[:min].nil? && stats[:max].nil? && stats[:avg] # Only avg length available
-        parts << "avg_len:#{stats[:avg]&.round(1)}"
-     elsif !stats[:min].nil? || !stats[:max].nil? # Min/Max length available
-        parts << "len:[min:#{stats[:min]}, max:#{stats[:max]}, avg:#{stats[:avg]&.round(1)}]"
-     end
+    # Avg length is stored in :avg for these types
+    formatted_stats[:avg_length] = stats[:avg]&.round(1) if stats[:avg]
   when :integer, :float, :decimal # Numeric types
-    parts << "rng:[min:#{stats[:min]}, max:#{stats[:max]}]" unless stats[:min].nil? && stats[:max].nil?
-    parts << "avg:#{stats[:avg]&.round(2)}" if stats[:avg]
+    formatted_stats[:average] = stats[:avg]&.round(2) if stats[:avg]
   when :boolean
-    parts << "true:#{stats[:true_percentage]&.round(1)}%" if stats[:true_percentage]
+    formatted_stats[:true_percentage] = stats[:true_percentage]&.round(1) if stats[:true_percentage]
   when :array # PG Array
-    parts << "items:[min:#{stats[:min]}, max:#{stats[:max]}, avg:#{stats[:avg]&.round(1)}]" unless stats[:min].nil? && stats[:max].nil?
+    # Avg array items count is stored in :avg
+    formatted_stats[:avg_items] = stats[:avg]&.round(1) if stats[:avg]
   when :date, :datetime, :time, :timestamp # Date/Time types
-    parts << "rng:[min:#{stats[:min]}, max:#{stats[:max]}]" unless stats[:min].nil? && stats[:max].nil?
+    # No specific avg for dates, min/max handled above
   end
-  parts.join(', ')
+
+  formatted_stats
 end
 
 # Truncate long values for display (remains the same)
-def truncate_value(value, max_length = 25)
+def truncate_value(value, max_length = 80) # Increased max length significantly
   str = value.to_s
-  str.length > max_length ? "#{str[0...(max_length - 3)]}..." : str
+  # Handle multi-line strings by taking the first line
+  first_line = str.split("\n").first || ''
+  first_line.length > max_length ? "#{first_line[0...(max_length - 3)]}..." : first_line
 end
 
 # Print the analysis summary to the console (adjusted for Sequel stats structure)
 def print_summary_report(report)
   meta = report[:metadata]
   puts colored_output("\n--- Database Analysis Summary (Sequel) ---", :magenta, :bold)
-  # Use :database_type from metadata
-  puts colored_output("DB Adapter: #{meta[:database_adapter]}, Type: #{meta[:database_type]}, Version: #{meta[:database_version]}", :magenta)
-  puts colored_output("Generated at: #{meta[:generated_at]}, Duration: #{meta[:analysis_duration_seconds]}s", :magenta)
+  puts colored_output("Adapter: #{meta[:database_adapter]}, Type: #{meta[:database_type]}, Version: #{meta[:database_version]}", :magenta)
+  puts colored_output("Generated: #{meta[:generated_at]}, Duration: #{meta[:analysis_duration_seconds]}s", :magenta)
   puts colored_output("Tables Analyzed: #{meta[:analyzed_tables].length}", :magenta)
 
   report[:tables].each do |table_name, table_data|
@@ -891,23 +930,50 @@ def print_summary_report(report)
     table_data.each do |column_name, stats|
       next unless stats.is_a?(Hash)
 
-      null_perc = stats[:count].to_i.positive? ? (stats[:null_count].to_f / stats[:count] * 100).round(1) : 0
       unique_marker = stats[:is_unique] ? colored_output(' (unique)', :light_blue) : ''
-      # Display both abstract type and db type
-      puts colored_output("  - #{column_name} (#{stats[:type]}/#{stats[:db_type]})#{unique_marker}", :yellow)
-      puts "    Nulls: #{stats[:null_count]} (#{null_perc}%)"
+      puts colored_output("  - #{column_name}#{unique_marker}", :yellow)
 
-      summary_stats = format_stats_for_summary(stats)
-      puts "    Stats: #{summary_stats}" unless summary_stats.empty?
+      # Display type, handling potentially missing abstract type
+      type_part = stats[:type].to_s
+      db_type_part = stats[:db_type].to_s
+      type_str = if type_part.empty? || type_part == db_type_part
+                   db_type_part # Show only db_type if abstract is missing or same
+                 else
+                   "#{type_part} / #{db_type_part}"
+                 end
+      puts "    Type:          #{type_str}"
+
+      # Only show nulls if count > 0
+      if stats[:null_count].to_i.positive?
+        null_perc = stats[:count].to_i.positive? ? (stats[:null_count].to_f / stats[:count] * 100).round(1) : 0
+        puts "    Nulls:         #{stats[:null_count]} (#{null_perc}%)"
+      end
+
+      formatted = format_stats_for_summary(stats)
+
+      # Print individual stats if they exist
+      puts "    Min:           #{truncate_value(formatted[:min])}" if formatted.key?(:min)
+      puts "    Max:           #{truncate_value(formatted[:max])}" if formatted.key?(:max)
+      puts "    Average:       #{formatted[:average]}" if formatted.key?(:average)
+      puts "    Avg Length:    #{formatted[:avg_length]}" if formatted.key?(:avg_length)
+      puts "    Avg Items:     #{formatted[:avg_items]}" if formatted.key?(:avg_items) # For arrays
+      puts "    True %:        #{formatted[:true_percentage]}%" if formatted.key?(:true_percentage)
+      puts "    Distinct:      #{stats[:distinct_count]}" if stats[:distinct_count] && stats[:distinct_count] > 0
 
       # Use :most_frequent and :least_frequent symbols
       if stats[:most_frequent]&.any?
-        freq_values = stats[:most_frequent].map { |v, c| "'#{truncate_value(v)}'(#{c})" }.join(', ')
-        puts "    Top 5: #{freq_values}"
+        puts "    Most Frequent:"
+        stats[:most_frequent].each_with_index do |(v, c), i|
+          prefix = i == 0 ? "      - " : "        "
+          puts "#{prefix}#{truncate_value(v)} (#{c})"
+        end
       end
       if stats[:least_frequent]&.any?
-        lfreq_values = stats[:least_frequent].map { |v, c| "'#{truncate_value(v)}'(#{c})" }.join(', ')
-        puts "    Bottom 5: #{lfreq_values}"
+         puts "    Least Frequent:"
+         stats[:least_frequent].each_with_index do |(v, c), i|
+           prefix = i == 0 ? "      - " : "        "
+           puts "#{prefix}#{truncate_value(v)} (#{c})"
+         end
       end
     end
   end

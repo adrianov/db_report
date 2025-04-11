@@ -1,6 +1,7 @@
 source 'https://rubygems.org'
 
 gem 'activerecord', '~> 7.0'
+gem 'sequel', '~> 5.74'     # Sequel ORM toolkit
 gem 'pg', '~> 1.5'       # PostgreSQL adapter
 # gem 'mysql2', '~> 0.5'   # MySQL adapter, comment if not needed
 gem 'sqlite3', '~> 1.6'  # SQLite adapter, comment if not needed

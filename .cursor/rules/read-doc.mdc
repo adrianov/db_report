@@ -1,0 +1,6 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+When fixing error, considering specific gem or library, find its documentation on the web or local file system, and consult to it.

@@ -87,11 +87,11 @@ module DbReport
     end
 
     # Truncate long values for display
-    def truncate_value(value, max_length = 80)
+    def truncate_value(value, max_length = 30)
+      return '' if value.nil?
       str = value.to_s
       # Handle multi-line strings by taking the first line
-      first_line = str.split("
-").first || ''
+      first_line = str.split("\n").first || ''
       first_line.length > max_length ? "#{first_line[0...(max_length - 3)]}..." : first_line
     end
 

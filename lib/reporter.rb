@@ -294,8 +294,8 @@ Table: #{table_name}", :cyan, :bold)
           distinct_str = stats[:distinct_count] ? "#{stats[:distinct_count]}#{stats[:is_unique] ? ' (U)' : ''}" : ''
 
           formatted = format_stats_for_summary(stats)
-          min_val = formatted[:min].nil? ? '' : truncate_value(formatted[:min], 15)
-          max_val = formatted[:max].nil? ? '' : truncate_value(formatted[:max], 15)
+          min_val = formatted[:min].nil? ? '' : truncate_value(formatted[:min], 25)
+          max_val = formatted[:max].nil? ? '' : truncate_value(formatted[:max], 25)
           avg_val = if formatted.key?(:average)
                       formatted[:average].to_s # Ensure string for emptiness check
                     elsif formatted.key?(:avg_length)
@@ -311,7 +311,7 @@ Table: #{table_name}", :cyan, :bold)
           most_freq_str = ''
           if formatted[:most_frequent]&.any?
             top_val, top_count = formatted[:most_frequent].first
-            most_freq_str = "#{truncate_value(top_val, 15)} (#{top_count})"
+            most_freq_str = "#{truncate_value(top_val, 25)} (#{top_count})"
           end
 
           # Collect row data (raw values before colorization where possible for checks)

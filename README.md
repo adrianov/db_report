@@ -14,10 +14,10 @@ A Ruby utility for analyzing database structure and generating detailed statisti
   - Type-specific metrics (array lengths, boolean distributions, etc.)
 - Search capability to find specific values across tables and columns
 - Works with PostgreSQL, MySQL, and SQLite (via Sequel adapters). **Note:** Currently, thorough testing has primarily focused on PostgreSQL.
-- Output as JSON or a human-readable summary format
+- Output as JSON, compact, summary, or GPT-friendly format
 - Debugging mode with detailed SQL logging
 - Colorized console output
-- Parallel processing for faster analysis of multiple tables
+- Parallel processing for faster analysis of multiple tables (enabled by default)
 
 ## Installation
 
@@ -29,6 +29,21 @@ A Ruby utility for analyzing database structure and generating detailed statisti
 bundle install
 ```
 
+### ZSH Alias (Optional)
+
+For convenience, you can add an alias to your `.zshrc` file:
+
+```bash
+# Add to your ~/.zshrc
+alias dbreport="/path/to/db_report.rb"
+```
+
+Then reload your shell configuration:
+
+```bash
+source ~/.zshrc
+```
+
 ## Usage
 
 Run the script with:
@@ -37,22 +52,27 @@ Run the script with:
 ruby db_report.rb [options]
 ```
 
+Or if you added the alias:
+
+```bash
+dbreport [options]
+```
+
 ### Command Line Options
 
 ```
 -d, --database-url URL           Database connection URL (Sequel format, overrides config)
 -e, --environment ENV            Environment section in config/database.yml (default: development)
--b, --database NAME              Specific database name (overrides config/URL)
+-b, --database NAME              Specific database name (overrides config/URL database component)
 -l, --list-databases             List available databases and exit
 -o, --output FILE                Output report to file instead of stdout
--t, --tables TBL1,TBL2,...       Analyze only specific tables (comma-separated, use schema.table if needed)
--f, --format FMT                 Output format: json/summary (default: json)
+-t, --tables TBLS                Analyze only specific tables (comma-separated)
+-f, --format FMT                 Output format: json/summary/gpt/compact (default: compact)
 -p, --pool SIZE                  Max connections pool size (default: 5)
--s, --search VALUE               Search for a specific value across all tables or specified tables
---timeout SECS                   Database connection timeout (default: 10)
---parallel                       Use parallel processing for analyzing tables
---parallel-processes NUM         Number of parallel processes to use (default: auto-detect)
---debug                          Show detailed debug information and SQL logging
+    --timeout SECS               Database connection timeout (default: 10)
+    --parallel-processes NUM     Number of parallel processes to use for table analysis (default: auto-detect)
+-s, --search-value VALUE         Search for specific value in all tables and columns
+    --debug                      Show detailed debug information and SQL logging
 -h, --help                       Show this help message
 ```
 
@@ -83,12 +103,7 @@ Output a JSON report to a file:
 ruby db_report.rb -o reports/db_stats_$(date +%F).json
 ```
 
-Enable parallel processing with auto-detection of processor count:
-```bash
-ruby db_report.rb --parallel
-```
-
-Enable parallel processing with a specific number of processes:
+Specify the number of parallel processes to use:
 ```bash
 ruby db_report.rb --parallel-processes 4
 ```
@@ -100,12 +115,12 @@ ruby db_report.rb --debug
 
 Search for a specific value across all tables:
 ```bash
-ruby db_report.rb --search "Freund"
+ruby db_report.rb --search-value "Freund"
 ```
 
 Search for a value in specific tables:
 ```bash
-ruby db_report.rb --search "Freund" --tables words,translations
+ruby db_report.rb --search-value "Freund" --tables words,translations
 ```
 
 ### Database Connection
@@ -124,12 +139,11 @@ The script determines the database connection configuration using the following 
 
 ### Parallel Processing
 
-The `--parallel` option enables parallel processing of tables, which can significantly speed up analysis when dealing with multiple tables. Each table is analyzed in a separate process, utilizing all available CPU cores.
+Parallel processing is enabled by default to significantly speed up analysis when dealing with multiple tables. Each table is analyzed in a separate process, utilizing all available CPU cores.
 
 - By default, the number of parallel processes is auto-detected based on your system's processor count.
 - You can specify a custom number of processes with `--parallel-processes NUM`.
 - Each process creates its own database connection, so ensure your database server can handle the additional connections.
-- The `parallel` gem is required for this feature. It's included in the Gemfile.
 
 **Note:** When using parallel processing, the total number of database connections can be high (processes × pool size). Adjust your database server's connection limit accordingly.
 
@@ -140,13 +154,13 @@ The search feature allows you to find specific values within your database table
 #### Usage
 
 ```bash
-ruby db_report.rb -s, --search VALUE [options]
+ruby db_report.rb --search-value VALUE [options]
 ```
 
 The search feature can be combined with other options to narrow down the scope:
 
 ```bash
-ruby db_report.rb --search "Freund" --tables words
+ruby db_report.rb --search-value "Freund" --tables words
 ```
 
 #### Example Output
@@ -252,24 +266,4 @@ The JSON output includes metadata and detailed stats per table/column:
 
 ## License
 
-MIT License
-
-Copyright (c) 2025 Peter Adrianov
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

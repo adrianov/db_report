@@ -739,14 +739,6 @@ def analyze_frequency(col_stats, column_sym, base_dataset, column_type, unique_s
   # Robust check for JSON types (handles symbols and strings)
   is_json_type = column_type.to_s.include?('json') || (column_type.to_s.empty? && col_stats[:db_type].to_s.include?('json'))
 
-  # --- Added Debugging for type check ---
-  if $debug && is_json_type
-    puts colored_output("    [Debug JSON Check] Column: #{column_sym}, Type: #{column_type.inspect}, Detected as JSON.", :magenta)
-  elsif $debug
-    puts colored_output("    [Debug JSON Check] Column: #{column_sym}, Type: #{column_type.inspect}, NOT detected as JSON.", :magenta)
-  end
-  # --- End Debugging ---
-
   unless groupable || is_json_type
     print_debug("    Skipping frequency analysis for non-groupable type: #{column_sym} (#{column_type})") if $debug
     return

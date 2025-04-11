@@ -1,0 +1,155 @@
+# frozen_string_literal: true
+
+require 'json'
+require 'fileutils'
+
+module DbReport
+  class Reporter
+    include Utils # Include Utils for formatting, logging, etc.
+
+    attr_reader :report_data
+
+    def initialize(report_data)
+      @report_data = report_data
+    end
+
+    # Format stats for the summary output view
+    def format_stats_for_summary(stats)
+      formatted_stats = {}
+      type = stats[:type]&.to_sym rescue nil # Type from col_stats
+      is_json_type = type.to_s.include?('json') || (type.to_s.empty? && stats[:db_type].to_s.include?('json'))
+
+      # Common stats
+      formatted_stats[:min] = stats[:min] unless stats[:min].nil?
+      formatted_stats[:max] = stats[:max] unless stats[:max].nil?
+
+      # Type-specific stats
+      case type
+      when :string, :text, :xml, :blob, :enum, :inet
+        formatted_stats[:avg_length] = stats[:avg]&.round(1) if stats[:avg]
+      when :integer, :float, :decimal
+        formatted_stats[:average] = stats[:avg]&.round(2) if stats[:avg]
+      when :boolean
+        formatted_stats[:true_percentage] = stats[:true_percentage]&.round(1) if stats[:true_percentage]
+      when :array
+        formatted_stats[:avg_items] = stats[:avg]&.round(1) if stats[:avg] # Avg array items
+      when :json, :jsonb
+        formatted_stats[:avg_length] = stats[:avg]&.round(1) if stats[:avg] # Avg length of text representation
+      when :uuid
+        formatted_stats[:avg_length] = stats[:avg]&.round(1) if stats[:avg] # Avg length of text representation
+      end
+
+      # Fallback for JSON if type wasn't inferred correctly but db_type indicates it
+      if is_json_type && stats[:avg] && !formatted_stats.key?(:avg_length)
+        formatted_stats[:avg_length] = stats[:avg]&.round(1)
+      end
+
+      # Add frequency data (use raw data, format during printing)
+      formatted_stats[:most_frequent] = stats[:most_frequent] if stats[:most_frequent]&.any?
+      formatted_stats[:least_frequent] = stats[:least_frequent] if stats[:least_frequent]&.any?
+
+      formatted_stats
+    end
+
+    # Print the analysis summary to the console
+    def print_summary
+      meta = report_data[:metadata]
+      puts colored_output("
+--- Database Analysis Summary (Sequel) ---", :magenta, :bold)
+      puts colored_output("Adapter: #{meta[:database_adapter]}, Type: #{meta[:database_type]}, Version: #{meta[:database_version]}", :magenta)
+      puts colored_output("Generated: #{meta[:generated_at]}, Duration: #{meta[:analysis_duration_seconds]}s", :magenta)
+      puts colored_output("Tables Analyzed: #{meta[:analyzed_tables].length}", :magenta)
+
+      report_data[:tables].each do |table_name, table_data|
+        puts colored_output("
+Table: #{table_name}", :cyan, :bold)
+
+        if table_data.is_a?(Hash) && table_data[:error]
+          puts colored_output("  Error: #{table_data[:error]}", :red)
+          next
+        end
+
+        unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
+           puts colored_output("  Skipping malformed data for table: #{table_name}", :yellow)
+           next
+        end
+
+        column_count = table_data.keys.length
+        # Safely access count from the first column's stats hash
+        first_col_stats = table_data.values.first || {}
+        row_count = first_col_stats[:count] || 'N/A' # Access :count symbol
+        puts colored_output("  Rows: #{row_count}, Columns: #{column_count}", :white)
+
+        table_data.each do |column_name, stats|
+          next unless stats.is_a?(Hash) # Ensure stats is a hash
+
+          unique_marker = stats[:is_unique] ? colored_output(' (unique)', :light_blue) : ''
+          puts colored_output("  - #{column_name}#{unique_marker}", :yellow)
+
+          type_part = stats[:type].to_s
+          db_type_part = stats[:db_type].to_s
+          type_str = if type_part.empty? || type_part == db_type_part
+                       db_type_part
+                     else
+                       "#{type_part} / #{db_type_part}"
+                     end
+          puts "    Type:          #{type_str}"
+
+          null_count = stats[:null_count].to_i
+          total_count = stats[:count].to_i
+          if null_count > 0
+             null_perc = total_count.positive? ? (null_count.to_f / total_count * 100).round(1) : 0
+             puts "    Nulls:         #{null_count} (#{null_perc}%)"
+          end
+
+          formatted = format_stats_for_summary(stats) # Use instance method
+
+          # Print individual stats
+          puts "    Min:           #{truncate_value(formatted[:min])}" if formatted.key?(:min)
+          puts "    Max:           #{truncate_value(formatted[:max])}" if formatted.key?(:max)
+          puts "    Average:       #{formatted[:average]}" if formatted.key?(:average)
+          puts "    Avg Length:    #{formatted[:avg_length]}" if formatted.key?(:avg_length)
+          puts "    Avg Items:     #{formatted[:avg_items]}" if formatted.key?(:avg_items)
+          puts "    True %:        #{formatted[:true_percentage]}%" if formatted.key?(:true_percentage)
+          puts "    Distinct:      #{stats[:distinct_count]}" if stats[:distinct_count] && stats[:distinct_count].to_i > 0
+
+          # Print frequency info
+          if formatted[:most_frequent]
+             puts "    Most Frequent:"
+             formatted[:most_frequent].each_with_index do |(v, c), i|
+                prefix = i == 0 ? "      - " : "        "
+                # Use truncate_value for display
+                puts "#{prefix}#{truncate_value(v)} (#{c})"
+             end
+          end
+          if formatted[:least_frequent]
+             puts "    Least Frequent:"
+             formatted[:least_frequent].each_with_index do |(v, c), i|
+                prefix = i == 0 ? "      - " : "        "
+                puts "#{prefix}#{truncate_value(v)} (#{c})"
+             end
+          end
+        end
+      end
+    end
+
+    # Write the JSON report to a file or stdout
+    def write_json(output_file)
+      # Use make_json_safe from Utils module
+      report_for_json = make_json_safe(report_data)
+      json_report = JSON.pretty_generate(report_for_json)
+
+      if output_file
+        begin
+          FileUtils.mkdir_p(File.dirname(output_file))
+          File.write(output_file, json_report)
+          print_info "Report successfully written to #{output_file}"
+        rescue StandardError => e
+          print_warning "Error writing report to file #{output_file}: #{e.message}"
+        end
+      else
+        puts json_report
+      end
+    end
+  end
+end

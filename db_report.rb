@@ -337,15 +337,21 @@ def establish_connection(db_config, pool_size, connect_timeout)
     rescue URI::InvalidURIError
       print_warning 'Could not parse adapter from URL to check gem.'
     end
-    # Add default timeouts to the URL connection if needed (Sequel might handle this)
-    connection_config = { conn_str: connection_config, max_connections: pool_size, connect_timeout: connect_timeout }
+    # We should connect directly with the URL string
+    # No need to add options to the URL string itself
   else
     abort_with_error 'Invalid database configuration provided.'
   end
 
   begin
     # Connect using Sequel.connect
-    $db = Sequel.connect(connection_config)
+    if connection_config.is_a?(String)
+      # Direct URL connection
+      $db = Sequel.connect(connection_config, max_connections: pool_size, connect_timeout: connect_timeout)
+    else
+      # Hash-based connection
+      $db = Sequel.connect(connection_config)
+    end
 
     # Add logger if debugging
     $db.loggers << Logger.new($stdout) if $debug
@@ -536,57 +542,130 @@ def build_aggregate_select_parts(column_type, column_sym, adapter_type, is_uniqu
 
   parts = [Sequel.function(:COUNT, column_sym).as(non_null_alias)]
   is_primary_or_foreign_key = is_unique || column_sym == :id || column_sym.to_s.end_with?('_id')
-  groupable = !%i[text blob json jsonb xml array hstore].include?(column_type)
+  groupable = !%i[text blob xml array hstore].include?(column_type)
 
+  # Handle MIN/MAX - needs special casting for some types
   case column_type
-  when :integer, :float, :decimal, :string, :text, :date, :datetime, :time, :boolean, :blob, :enum, :uuid, :inet, :json, :jsonb, :xml # Consolidate types with min/max
+  when :json, :jsonb
+    # MIN/MAX for JSON - need to cast to text first
+    cast_expr = Sequel.cast(column_sym, :text)
+    parts += [
+      Sequel.function(:MIN, cast_expr).as(min_alias),
+      Sequel.function(:MAX, cast_expr).as(max_alias)
+    ]
+  when :uuid
+    # UUID needs to be cast to text for MIN/MAX in PostgreSQL
+    if adapter_type == :postgres
+      cast_expr = Sequel.cast(column_sym, :text)
+      parts += [
+        Sequel.function(:MIN, cast_expr).as(min_alias),
+        Sequel.function(:MAX, cast_expr).as(max_alias)
+      ]
+    else
+      # Assume MIN/MAX works directly on UUID for other adapters (or skip)
+      print_warning "MIN/MAX on UUID might not be supported for #{adapter_type}" if $debug
+    end
+  when :boolean
+    # MIN/MAX are useful for booleans
     parts += [
       Sequel.function(:MIN, column_sym).as(min_alias),
       Sequel.function(:MAX, column_sym).as(max_alias)
     ]
+  when :array
+    # MIN/MAX for array length
+    if adapter_type == :postgres
+      parts += [
+        Sequel.function(:MIN, Sequel.function(:array_length, column_sym, 1)).as(min_alias),
+        Sequel.function(:MAX, Sequel.function(:array_length, column_sym, 1)).as(max_alias)
+      ]
+    end
+  else # Default for numeric, string, date, time, etc.
+    parts += [
+      Sequel.function(:MIN, column_sym).as(min_alias),
+      Sequel.function(:MAX, column_sym).as(max_alias)
+    ]
+  end
 
-    # Add AVG for numeric types unless it's unique, named 'id', or ends with '_id'
-    if !is_primary_or_foreign_key && [:integer, :float, :decimal].include?(column_type)
-      # Cast to float for AVG (double precision is common)
+  # Handle AVG, Distinct Count, True Count based on type
+  case column_type
+  when :integer, :float, :decimal # Numeric types
+    # Add AVG for numeric types unless it's unique
+    if !is_primary_or_foreign_key
       cast_type = adapter_type == :mysql ? :double : :'double precision'
       parts << Sequel.function(:AVG, Sequel.cast(column_sym, cast_type)).as(avg_alias)
       print_debug("    Adding AVG for numeric column: #{column_sym}") if $debug
-    elsif $debug && [:integer, :float, :decimal].include?(column_type)
-        print_debug("    Skipping AVG for numeric column: #{column_sym} (pk/fk: #{is_primary_or_foreign_key})")
-    end
-
-    # Add COUNT(DISTINCT) for groupable types unless it's unique, named 'id', or ends with '_id'
-    if groupable && !is_primary_or_foreign_key
-      parts << Sequel.function(:COUNT, Sequel.function(:DISTINCT, column_sym)).as(distinct_count_alias)
-      print_debug("    Adding COUNT(DISTINCT) for: #{column_sym}") if $debug
-    elsif $debug && groupable
-      print_debug("    Skipping COUNT(DISTINCT) for PK/FK/Unique: #{column_sym}")
     elsif $debug
-      print_debug("    Skipping COUNT(DISTINCT) for non-groupable type: #{column_sym}")
+      print_debug("    Skipping AVG for PK/FK/Unique numeric: #{column_sym}")
     end
 
-    # Add AVG length for string/text/complex types (only if not unique)
-    if !is_unique && [:string, :text, :json, :jsonb, :xml, :blob, :enum].include?(column_type)
+    # Add COUNT(DISTINCT) unless it's unique
+    if !is_primary_or_foreign_key
+      parts << Sequel.function(:COUNT, Sequel.function(:DISTINCT, column_sym)).as(distinct_count_alias)
+      print_debug("    Adding COUNT(DISTINCT) for numeric: #{column_sym}") if $debug
+    elsif $debug
+      print_debug("    Skipping COUNT(DISTINCT) for PK/FK/Unique numeric: #{column_sym}")
+    end
+
+  when :string, :text, :blob, :enum, :inet # String-like types (except UUID and JSON/JSONB)
+    # Add AVG length unless it's unique
+    if !is_unique
       length_expr = case adapter_type
                     when :postgres
-                      # Need to cast enum, json, jsonb, xml to text for length
-                      cast_target = [:enum, :json, :jsonb, :xml].include?(column_type) ? :text : nil
+                      cast_target = [:enum].include?(column_type) ? :text : nil
                       col_expr = cast_target ? Sequel.cast(column_sym, cast_target) : column_sym
                       Sequel.function(:length, col_expr)
-                    when :mysql
-                      Sequel.function(:length, column_sym) # MySQL length works on most types
-                    when :sqlite
-                      Sequel.function(:length, column_sym) # SQLite length
+                    when :mysql, :sqlite
+                      Sequel.function(:length, column_sym)
                     else
-                      Sequel.function(:length, column_sym) # Default assumption
+                      Sequel.function(:length, column_sym)
                     end
-      parts << Sequel.function(:AVG, length_expr).as(avg_alias) # Avg length
+      parts << Sequel.function(:AVG, length_expr).as(avg_alias)
+      print_debug("    Adding AVG length for string-like: #{column_sym}") if $debug
     end
 
-  when :boolean # Handle boolean true count separately
-    # SUM(CASE WHEN col THEN 1 ELSE 0 END)
+    # Add COUNT(DISTINCT) unless it's unique and groupable
+    if !is_primary_or_foreign_key && groupable
+      parts << Sequel.function(:COUNT, Sequel.function(:DISTINCT, column_sym)).as(distinct_count_alias)
+      print_debug("    Adding COUNT(DISTINCT) for string-like: #{column_sym}") if $debug
+    elsif $debug
+      print_debug("    Skipping COUNT(DISTINCT) for PK/FK/Unique/Non-Groupable string: #{column_sym}")
+    end
+
+  when :uuid # UUID type specific handling
+    # Add LENGTH average unless it's unique
+    if !is_unique
+      cast_expr = Sequel.cast(column_sym, :text)
+      parts << Sequel.function(:AVG, Sequel.function(:length, cast_expr)).as(avg_alias)
+      print_debug("    Adding AVG length for UUID: #{column_sym}") if $debug
+    end
+
+    # Add distinct count if not a PK/FK
+    if !is_primary_or_foreign_key
+      parts << Sequel.function(:COUNT, Sequel.function(:DISTINCT, column_sym)).as(distinct_count_alias)
+      print_debug("    Adding COUNT(DISTINCT) for UUID: #{column_sym}") if $debug
+    elsif $debug
+      print_debug("    Skipping COUNT(DISTINCT) for PK/FK/Unique UUID: #{column_sym}")
+    end
+
+  when :json, :jsonb # Direct JSON/JSONB handling
+    # Cast to text for length calc
+    cast_expr = Sequel.cast(column_sym, :text)
+    parts << Sequel.function(:AVG, Sequel.function(:length, cast_expr)).as(avg_alias)
+    print_debug("    Adding AVG length for JSON: #{column_sym}") if $debug
+
+    # Add distinct count if not a PK/FK
+    if !is_primary_or_foreign_key
+      parts << Sequel.function(:COUNT, Sequel.function(:DISTINCT, cast_expr)).as(distinct_count_alias)
+      print_debug("    Adding COUNT(DISTINCT) for JSON: #{column_sym}") if $debug
+    elsif $debug
+      print_debug("    Skipping COUNT(DISTINCT) for PK/FK/Unique JSON: #{column_sym}")
+    end
+
+  when :boolean
+    # SUM(CASE WHEN col THEN 1 ELSE 0 END) for true count
     parts << Sequel.function(:SUM, Sequel.case({ column_sym => 1 }, 0)).as(true_count_alias)
-    # Also add distinct count for boolean if not PK/FK
+
+    # Add distinct count if not PK/FK
     if !is_primary_or_foreign_key
       parts << Sequel.function(:COUNT, Sequel.function(:DISTINCT, column_sym)).as(distinct_count_alias)
       print_debug("    Adding COUNT(DISTINCT) for boolean: #{column_sym}") if $debug
@@ -594,22 +673,22 @@ def build_aggregate_select_parts(column_type, column_sym, adapter_type, is_uniqu
       print_debug("    Skipping COUNT(DISTINCT) for PK/FK/Unique boolean: #{column_sym}")
     end
 
-  when :array # PostgreSQL specific array handling
-    if adapter_type == :postgres
-      parts += [
-        Sequel.function(:MIN, Sequel.function(:array_length, column_sym, 1)).as(min_alias),
-        Sequel.function(:MAX, Sequel.function(:array_length, column_sym, 1)).as(max_alias)
-      ]
-      # Add AVG array length (only if not unique)
-      parts << Sequel.function(:AVG, Sequel.function(:array_length, column_sym, 1)).as(avg_alias) if !is_unique
-    else
-      print_warning "    Skipping array aggregates for non-PostgreSQL DB"
+  when :array
+    # Add AVG array length unless unique
+    if !is_unique && adapter_type == :postgres
+      parts << Sequel.function(:AVG, Sequel.function(:array_length, column_sym, 1)).as(avg_alias)
     end
-    # Do not add distinct count for arrays, as it's complex and often not useful
-    print_debug("    Skipping COUNT(DISTINCT) for array type: #{column_sym}") if $debug
 
-  # No specific aggregates for hstore, uuid, inet beyond min/max unless needed
+  when :date, :datetime, :time, :timestamp
+    # Add distinct count if not PK/FK
+    if !is_primary_or_foreign_key
+      parts << Sequel.function(:COUNT, Sequel.function(:DISTINCT, column_sym)).as(distinct_count_alias)
+      print_debug("    Adding COUNT(DISTINCT) for date/time: #{column_sym}") if $debug
+    elsif $debug
+      print_debug("    Skipping COUNT(DISTINCT) for PK/FK/Unique date/time: #{column_sym}")
+    end
   end
+
   parts
 end
 
@@ -654,10 +733,10 @@ def analyze_frequency(col_stats, column_sym, base_dataset, column_type, unique_s
   # - Column is not groupable (text, blob, xml, array, hstore) - JSON/JSONB are handled
   # - Column is known unique
   # - Column is likely a PK/FK
-  groupable = !%i[text blob xml array hstore].include?(column_type)
+  groupable = !%i[text blob xml array hstore json jsonb].include?(column_type)
   is_pk_or_fk = col_stats[:is_unique] || unique_single_columns.include?(column_sym) || column_sym == :id || column_sym.to_s.end_with?('_id')
   # Robust check for JSON types (handles symbols and strings)
-  is_json_type = column_type.to_s.include?('json')
+  is_json_type = column_type.to_s.include?('json') || (column_type.to_s.empty? && col_stats[:db_type].to_s.include?('json'))
 
   # --- Added Debugging for type check ---
   if $debug && is_json_type
@@ -667,47 +746,65 @@ def analyze_frequency(col_stats, column_sym, base_dataset, column_type, unique_s
   end
   # --- End Debugging ---
 
-  unless groupable
+  unless groupable || is_json_type
     print_debug("    Skipping frequency analysis for non-groupable type: #{column_sym} (#{column_type})") if $debug
     return
   end
 
-  if is_pk_or_fk
+  if is_pk_or_fk && !is_json_type
     print_debug("    Skipping frequency analysis for PK/FK or unique column: #{column_sym}") if $debug
     return
   end
 
   return unless col_stats[:count] > 0
 
-  # Define ordering based on type
-  most_freq_order = if is_json_type
-                      [Sequel.desc(:count)] # Order only by count for JSON
-                    else
-                      [Sequel.desc(:count), column_sym] # Original order
-                    end
-  least_freq_order = if is_json_type
-                       [Sequel.asc(:count)] # Order only by count for JSON
-                     else
-                       [Sequel.asc(:count), column_sym] # Original order
-                     end
-
   # Most Frequent
-  # Pass base_dataset, column, order, and limit to the refactored function
-  most_freq_results = execute_frequency_query(base_dataset, column_sym, most_freq_order, 5)
-  col_stats[:most_frequent] = most_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
+  if is_json_type
+    # For JSON columns, cast to text for grouping
+    print_info "    Analyzing JSON column frequency..."
+    begin
+      # Create a dataset that safely casts JSON to text and groups by the result
+      casted_column = Sequel.cast(column_sym, :text)
+      json_dataset = base_dataset.select(casted_column.as(column_sym), Sequel.function(:COUNT, Sequel.lit('*')).as(:count))
+                              .group(casted_column)
+                              .order(Sequel.desc(:count))
+                              .limit(5)
 
-  # Least Frequent (only if worthwhile)
-  distinct_count = col_stats[:distinct_count] || 0
+      print_debug("    JSON frequency SQL: #{json_dataset.sql}") if $debug
 
-  if distinct_count > 5
-    # Pass base_dataset, column, order, and limit
-    least_freq_results = execute_frequency_query(base_dataset, column_sym, least_freq_order, 5)
-    col_stats[:least_frequent] = least_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
-  elsif distinct_count > 0 && distinct_count <= 5 && col_stats[:most_frequent].empty?
-    # Fetch all distinct values if <= 5 and most_frequent wasn't populated (no limit needed, use least order)
-    # Pass nil as limit to fetch all
-    all_freq_results = execute_frequency_query(base_dataset, column_sym, least_freq_order, nil)
-    col_stats[:most_frequent] = all_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
+      # Execute the query with error handling
+      most_freq_results = json_dataset.all
+
+      col_stats[:most_frequent] = most_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
+      print_info "    Found #{col_stats[:most_frequent].size} frequent JSON patterns"
+    rescue Sequel::DatabaseError => e
+      puts colored_output("  SQL Frequency Error for JSON column #{column_sym}: #{e.message.lines.first.strip}", :red)
+      print_debug("  Failed JSON frequency SQL: #{json_dataset&.sql}") if $debug && json_dataset
+      col_stats[:most_frequent] = {} # Empty hash on error
+    end
+
+    # For JSON, we'll skip least frequent to keep things simple
+  else
+    # Regular columns use the standard frequency query with count and column desc
+    most_freq_order = [Sequel.desc(:count), column_sym] # Original order
+    least_freq_order = [Sequel.asc(:count), column_sym] # Original order
+
+    most_freq_results = execute_frequency_query(base_dataset, column_sym, most_freq_order, 5)
+    col_stats[:most_frequent] = most_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
+
+    # Least Frequent (only if worthwhile)
+    distinct_count = col_stats[:distinct_count] || 0
+
+    if distinct_count > 5
+      # Pass base_dataset, column, order, and limit
+      least_freq_results = execute_frequency_query(base_dataset, column_sym, least_freq_order, 5)
+      col_stats[:least_frequent] = least_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
+    elsif distinct_count > 0 && distinct_count <= 5 && col_stats[:most_frequent].empty?
+      # Fetch all distinct values if <= 5 and most_frequent wasn't populated (no limit needed, use least order)
+      # Pass nil as limit to fetch all
+      all_freq_results = execute_frequency_query(base_dataset, column_sym, least_freq_order, nil)
+      col_stats[:most_frequent] = all_freq_results.to_h { |row| [row[column_sym].to_s, row[:count].to_i] }
+    end
   end
 
 rescue Sequel::DatabaseError => e
@@ -732,6 +829,22 @@ def analyze_table(table_name_string)
   begin
     # Get schema using the potentially qualified identifier
     columns_schema = $db.schema(table_identifier).to_h { |col_info| [col_info[0], col_info[1]] } # { col_name_sym => {db_type:, type:, ...}}
+
+    # --- Enhanced Type Detection ---
+    columns_schema.each do |col_sym, col_info|
+      db_type = col_info[:db_type].to_s.downcase
+      # If Sequel didn't assign a type or assigned generic 'string', try to infer
+      if col_info[:type].nil? || col_info[:type].to_s.empty? || (col_info[:type] == :string && (db_type.include?('json') || db_type == 'uuid'))
+        if db_type.include?('json')
+          col_info[:type] = :json
+          print_debug("    Inferred type :json for column #{col_sym} based on db_type: #{col_info[:db_type]}") if $debug
+        elsif db_type == 'uuid'
+          col_info[:type] = :uuid
+          print_debug("    Inferred type :uuid for column #{col_sym} based on db_type: #{col_info[:db_type]}") if $debug
+        end
+      end
+    end
+    # --- End Enhanced Type Detection ---
 
     # Base dataset using the identifier (no more sampling)
     base_dataset = $db[table_identifier]
@@ -764,7 +877,7 @@ def analyze_table(table_name_string)
 
     # 1. Build all aggregate expressions and initial stats
     columns_schema.each do |column_sym, column_info|
-      column_type = column_info[:type]
+      column_type = column_info[:type] # Now using the potentially inferred type
       db_type = column_info[:db_type]
       is_unique = unique_single_columns.include?(column_sym)
 
@@ -801,13 +914,16 @@ def analyze_table(table_name_string)
 
     # 3. Populate stats from results and run frequency analysis
     columns_schema.each do |column_sym, column_info|
-      column_type = column_info[:type]
+      column_type = column_info[:type] # Use the potentially updated type
+      is_json = column_type == :json || column_type == :jsonb
+
       # Get the pre-initialized stats
       col_stats = initial_col_stats[column_sym]
 
       # Print analysis message here
       unique_marker = col_stats[:is_unique] ? ' (unique)' : ''
-      print_info "  - Analyzing column: #{column_sym} (#{col_stats[:type]}/#{col_stats[:db_type]})#{unique_marker}", :white
+      type_marker = "(#{col_stats[:type]}/#{col_stats[:db_type]})"
+      print_info "  - Analyzing column: #{column_sym} #{type_marker}#{unique_marker}", :white
 
       # Populate from the single result hash if it exists
       if all_agg_results
@@ -822,8 +938,8 @@ def analyze_table(table_name_string)
       end
 
       # --- Added Debugging ---
-      if $debug && table_name_string == 'datasources' && column_sym == :information_schema
-        puts colored_output("    [Debug Type Check] Table: #{table_name_string}, Column: #{column_sym}, Detected Type: #{column_type.inspect}", :magenta)
+      if $debug && is_json
+        puts colored_output("    [Debug JSON Stats] Column: #{column_sym}, Avg: #{col_stats[:avg]}, Type: #{column_type.inspect}", :magenta)
       end
       # --- End Added Debugging ---
 
@@ -874,13 +990,16 @@ def format_stats_for_summary(stats)
   formatted_stats = {}
   type = stats[:type].to_sym rescue nil # Type from col_stats
 
+  # Check if it's actually JSON even if type doesn't indicate it
+  is_json_type = type.to_s.include?('json') || (type.to_s.empty? && stats[:db_type].to_s.include?('json'))
+
   # Common stats
   formatted_stats[:min] = stats[:min] unless stats[:min].nil?
   formatted_stats[:max] = stats[:max] unless stats[:max].nil?
 
   # Use abstracted Sequel types
   case type
-  when :string, :text, :json, :jsonb, :xml, :blob, :enum, :uuid, :inet # Group string-like/complex types
+  when :string, :text, :xml, :blob, :enum, :inet # Group string-like/complex types except JSON and UUID
     # Avg length is stored in :avg for these types
     formatted_stats[:avg_length] = stats[:avg]&.round(1) if stats[:avg]
   when :integer, :float, :decimal # Numeric types
@@ -892,6 +1011,24 @@ def format_stats_for_summary(stats)
     formatted_stats[:avg_items] = stats[:avg]&.round(1) if stats[:avg]
   when :date, :datetime, :time, :timestamp # Date/Time types
     # No specific avg for dates, min/max handled above
+  when :json, :jsonb # Explicitly handle JSON types
+    formatted_stats[:avg_length] = stats[:avg]&.round(1) if stats[:avg]
+  when :uuid # UUID type
+    formatted_stats[:avg_length] = stats[:avg]&.round(1) if stats[:avg]
+  end
+
+  # When type is empty but db_type indicates JSON, ensure length is shown
+  if is_json_type && stats[:avg]
+    formatted_stats[:avg_length] = stats[:avg]&.round(1)
+  end
+
+  # Add most_frequent/least_frequent even for JSON types
+  if stats[:most_frequent]&.any?
+    formatted_stats[:most_frequent] = stats[:most_frequent]
+  end
+
+  if stats[:least_frequent]&.any?
+    formatted_stats[:least_frequent] = stats[:least_frequent]
   end
 
   formatted_stats
@@ -960,17 +1097,17 @@ def print_summary_report(report)
       puts "    True %:        #{formatted[:true_percentage]}%" if formatted.key?(:true_percentage)
       puts "    Distinct:      #{stats[:distinct_count]}" if stats[:distinct_count] && stats[:distinct_count] > 0
 
-      # Use :most_frequent and :least_frequent symbols
-      if stats[:most_frequent]&.any?
+      # Use :most_frequent and :least_frequent symbols - now works for JSON too
+      if formatted[:most_frequent]&.any?
         puts "    Most Frequent:"
-        stats[:most_frequent].each_with_index do |(v, c), i|
+        formatted[:most_frequent].each_with_index do |(v, c), i|
           prefix = i == 0 ? "      - " : "        "
           puts "#{prefix}#{truncate_value(v)} (#{c})"
         end
       end
-      if stats[:least_frequent]&.any?
+      if formatted[:least_frequent]&.any?
          puts "    Least Frequent:"
-         stats[:least_frequent].each_with_index do |(v, c), i|
+         formatted[:least_frequent].each_with_index do |(v, c), i|
            prefix = i == 0 ? "      - " : "        "
            puts "#{prefix}#{truncate_value(v)} (#{c})"
          end

@@ -16,6 +16,7 @@ A Ruby utility for analyzing database structure and generating detailed statisti
 - Output as JSON or a human-readable summary format
 - Debugging mode with detailed SQL logging
 - Colorized console output
+- Parallel processing for faster analysis of multiple tables
 
 ## Installation
 
@@ -47,6 +48,8 @@ ruby db_report.rb [options]
 -f, --format FMT                 Output format: json/summary (default: json)
 -p, --pool SIZE                  Max connections pool size (default: 5)
 --timeout SECS                   Database connection timeout (default: 10)
+--parallel                       Use parallel processing for analyzing tables
+--parallel-processes NUM         Number of parallel processes to use (default: auto-detect)
 --debug                          Show detailed debug information and SQL logging
 -h, --help                       Show this help message
 ```
@@ -78,6 +81,16 @@ Output a JSON report to a file:
 ruby db_report.rb -o reports/db_stats_$(date +%F).json
 ```
 
+Enable parallel processing with auto-detection of processor count:
+```bash
+ruby db_report.rb --parallel
+```
+
+Enable parallel processing with a specific number of processes:
+```bash
+ruby db_report.rb --parallel-processes 4
+```
+
 Enable debug logging:
 ```bash
 ruby db_report.rb --debug
@@ -97,6 +110,17 @@ The script determines the database connection configuration using the following 
 
 **Note for Rails Users:** The script is designed to work seamlessly with standard Rails `config/database.yml` files and respects the `RAILS_ENV` environment variable for selecting the default environment if `--environment` is not provided.
 
+### Parallel Processing
+
+The `--parallel` option enables parallel processing of tables, which can significantly speed up analysis when dealing with multiple tables. Each table is analyzed in a separate process, utilizing all available CPU cores.
+
+- By default, the number of parallel processes is auto-detected based on your system's processor count.
+- You can specify a custom number of processes with `--parallel-processes NUM`.
+- Each process creates its own database connection, so ensure your database server can handle the additional connections.
+- The `parallel` gem is required for this feature. It's included in the Gemfile.
+
+**Note:** When using parallel processing, the total number of database connections can be high (processes × pool size). Adjust your database server's connection limit accordingly.
+
 ## Output Example (JSON)
 
 The JSON output includes metadata and detailed stats per table/column:
@@ -112,7 +136,9 @@ The JSON output includes metadata and detailed stats per table/column:
       "public.users",
       "public.orders"
     ],
-    "analysis_duration_seconds": 15.72
+    "analysis_duration_seconds": 15.72,
+    "parallel_processing": true,
+    "parallel_processes": 8
   },
   "tables": {
     "public.users": {
@@ -165,6 +191,7 @@ The JSON output includes metadata and detailed stats per table/column:
 - Bundler
 - Sequel gem (`~> 5.0`)
 - Corresponding database adapter gem (`pg`, `mysql2`, or `sqlite3`)
+- Parallel gem (`~> 1.0`) for parallel processing
 
 ## License
 

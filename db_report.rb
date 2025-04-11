@@ -65,7 +65,9 @@ class DbReportApp
       database: nil,
       database_url: nil,
       list_databases: false,
-      connect_timeout: DbReport::Utils::DEFAULT_CONNECT_TIMEOUT
+      connect_timeout: DbReport::Utils::DEFAULT_CONNECT_TIMEOUT,
+      parallel: true,
+      parallel_processes: nil
     }
 
     parser = OptionParser.new do |opts|
@@ -93,6 +95,9 @@ class DbReportApp
       end
       opts.on('--timeout SECS', Integer, "Database connection timeout (default: #{DbReport::Utils::DEFAULT_CONNECT_TIMEOUT})") do |t|
         options[:connect_timeout] = t if t.positive?
+      end
+      opts.on('--parallel-processes NUM', Integer, "Number of parallel processes to use for table analysis (default: auto-detect)") do |n|
+        options[:parallel_processes] = n if n.positive?
       end
       opts.on('--debug', 'Show detailed debug information and SQL logging') { options[:debug] = true }
       opts.on('-h', '--help', 'Show this help message') { puts opts; exit }
@@ -198,10 +203,14 @@ class DbReportApp
     # Prepare the main report structure
     report_data = generate_report_structure(db_connection, tables_to_analyze)
 
-    # Analyze each table and store results
-    tables_to_analyze.each do |table_name|
-      report_data[:tables][table_name] = analyzer.analyze_table(table_name)
-    end
+    # Analyze tables in parallel (now the default)
+    # Add parallel processing info to metadata
+    report_data[:metadata][:parallel_processing] = true
+    report_data[:metadata][:parallel_processes] = options[:parallel_processes] || "auto-detected"
+
+    # Analyze tables in parallel and store results directly
+    table_results = analyzer.analyze_tables_in_parallel(tables_to_analyze, options[:parallel_processes])
+    report_data[:tables] = table_results
 
     # 4. Generate and Output Report
     finalize_and_output_report(report_data, start_time)
@@ -248,7 +257,8 @@ Available databases (from current connection's perspective):", :green, :bold
                             'unknown'
                           end,
         analyzed_tables: tables_to_analyze, # List of tables included in the report
-        analysis_duration_seconds: nil # Placeholder
+        analysis_duration_seconds: nil, # Placeholder
+        parallel_processing: false # Default, will be updated if parallel mode used
       },
       tables: {} # Placeholder for table-specific analysis results
     }

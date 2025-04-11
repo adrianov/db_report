@@ -17,3 +17,4 @@ gem 'time'
 gem 'colorize', '~> 0.8'         # For colored terminal output
 gem 'terminal-table', '~> 3.0'   # For formatted console tables
 gem 'progress_bar', '~> 1.3'     # For progress indicators when processing large tables
+gem 'parallel', '~> 1.23'        # For parallel processing of tables

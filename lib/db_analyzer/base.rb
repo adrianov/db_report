@@ -108,24 +108,48 @@ module DbReport
         table_identifier = create_sequel_identifier(table_name)
         is_postgres = db.database_type == :postgres
 
-        # Separate columns that need individual handling from those that can use UNION
+        # Separate columns that need very specialized handling from those that can use UNION
         union_compatible_columns = []
         special_columns = []
+
+        # Try parsing numeric values upfront for later use
+        numeric_search_value = nil
+        float_search_value = nil
+        begin
+          numeric_search_value = Integer(search_value)
+          float_search_value = Float(search_value)
+        rescue ArgumentError
+          # Not a valid number, leave as nil
+        end
+
+        # Check if it's a boolean
+        bool_search_value = case search_value.downcase
+                          when 'true', 't', 'yes', 'y', '1' then true
+                          when 'false', 'f', 'no', 'n', '0' then false
+                          end
 
         # Categorize columns by search compatibility
         columns_schema.each do |column_sym, column_info|
           case column_info[:type]
-          when :integer, :bigint, :float, :decimal, :numeric, :boolean, :date, :datetime, :timestamp
+          when :date, :datetime, :timestamp
             # These types need specialized handling
             special_columns << { column_sym: column_sym, column_info: column_info }
+          when :boolean
+            # Only include booleans if the search value is a boolean
+            if bool_search_value.nil?
+              special_columns << { column_sym: column_sym, column_info: column_info }
+            else
+              union_compatible_columns << { column_sym: column_sym, column_info: column_info }
+            end
           else
-            # All other types can potentially use a text-based search with UNION
+            # All other types can use a combined query
             union_compatible_columns << { column_sym: column_sym, column_info: column_info }
           end
         end
 
         # Process all union-compatible columns in a single batch
-        search_all_compatible_columns(table_identifier, union_compatible_columns, search_value, col_stats) if union_compatible_columns.any?
+        search_all_compatible_columns(table_identifier, union_compatible_columns, search_value, col_stats,
+                                      numeric_search_value, float_search_value, bool_search_value) if union_compatible_columns.any?
 
         # Process special columns individually
         special_columns.each do |col_data|
@@ -134,7 +158,8 @@ module DbReport
       end
 
       # Search all compatible columns with a single UNION query
-      def search_all_compatible_columns(table_identifier, columns, search_value, col_stats)
+      def search_all_compatible_columns(table_identifier, columns, search_value, col_stats,
+                                        numeric_value = nil, float_value = nil, bool_value = nil)
         return if columns.empty?
 
         begin
@@ -147,6 +172,30 @@ module DbReport
 
             # Build appropriate query part based on column type
             query_part = case column_info[:type]
+            when :integer, :bigint
+              if numeric_value.nil?
+                # If search value is not a number, include a cast-based search for flexibility
+                "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)}::text ILIKE #{db.literal("%#{search_value}%")}"
+              else
+                # If search value is a number, include both exact and cast-based search
+                "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)} = #{numeric_value} OR #{db.literal(column_sym)}::text ILIKE #{db.literal("%#{search_value}%")}"
+              end
+            when :float, :decimal, :numeric
+              if float_value.nil?
+                # If search value is not a number, include a cast-based search for flexibility
+                "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)}::text ILIKE #{db.literal("%#{search_value}%")}"
+              else
+                # If search value is a number, include both exact and cast-based search
+                "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)} = #{float_value} OR #{db.literal(column_sym)}::text ILIKE #{db.literal("%#{search_value}%")}"
+              end
+            when :boolean
+              if bool_value.nil?
+                # If search value is not a boolean, only do a text search
+                "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)}::text ILIKE #{db.literal("%#{search_value}%")}"
+              else
+                # If search value is a boolean, do an exact match
+                "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE #{db.literal(column_sym)} = #{bool_value}"
+              end
             when :array
               if is_postgres
                 "SELECT '#{column_sym}' AS col_name, COUNT(*) > 0 AS found FROM #{db.literal(table_identifier)} WHERE EXISTS (SELECT 1 FROM unnest(#{db.literal(column_sym)}) AS elem WHERE elem::text ILIKE #{db.literal("%#{search_value}%")})"
@@ -171,7 +220,7 @@ module DbReport
           # Execute the combined query
           unless query_parts.empty?
             combined_query = query_parts.join(" UNION ALL ")
-            print_debug "    Executing combined query for all text-compatible columns (#{query_parts.size} columns)" if debug
+            print_debug "    Executing combined query for all compatible columns (#{query_parts.size} columns)" if debug
             print_debug "    Query: #{combined_query}" if debug
             results = db.fetch(combined_query).all
 

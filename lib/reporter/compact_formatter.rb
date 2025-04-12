@@ -79,7 +79,16 @@ module DbReport
           # Filter out metadata keys before getting row count
           column_data = table_data.reject { |k, _| METADATA_KEYS.include?(k) }
           first_col_stats = column_data.values.first || {}
-          row_count = first_col_stats[:count] || &#39;N/A&#39;
+          row_count = first_col_stats[:count] || 'N/A'
+
+          # Determine title based on relation type
+          title = case table_data[:relation_type]
+                  when :table then "Table"
+                  when :view then "View"
+                  when :materialized_view then "Materialized View"
+                  else "Relation"
+                  end
+          relation_header_title = "#{title}: #{table_name} (Rows: #{row_count})"
 
           # Prepare data before creating the table
           all_rows_data = []
@@ -144,11 +153,11 @@ module DbReport
             row.reject.with_index { |_, index| empty_column_indices.include?(index) }
           end
 
-          # Print table title manually
-          puts colored_output(&quot;Table: #{table_name} (Rows: #{row_count})&quot;, :cyan, :bold)
-
           # Build table with filtered data
           table_summary = Terminal::Table.new do |t|
+            # Add header row spanning all columns
+            t.add_row [{ value: relation_header_title, colspan: filtered_headers.length, alignment: :center }]
+            t.add_separator # Add separator after header
             t.headings = filtered_headers
             t.rows = filtered_rows
             t.style = {
@@ -193,9 +202,9 @@ module DbReport
           else
             puts colored_output("\nValue '#{search_summary_data[:search_value]}' not found in any column", :yellow)
           end
-        end
-      end
-    end
-  end
-end
+        end # Closes if search_summary_data
+      end # Closes self.format
+    end # Closes module CompactFormatter
+  end # Closes module Reporter
+end # Closes module DbReport
 

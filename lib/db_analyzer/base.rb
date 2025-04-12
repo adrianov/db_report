@@ -35,17 +35,18 @@ module DbReport
       # --- Database Object Analysis --- #
 
       # Analyze a single database object (table, view, or materialized view)
-      def analyze_relation(relation_name_string)
-        relation_identifier = create_sequel_identifier(relation_name_string)
-        relation_type = get_relation_type(db, relation_name_string)
+      # Analyze a single database object (table, view, or materialized view)
+      def analyze_relation(table_name)
+        relation_identifier = create_sequel_identifier(table_name)
+        relation_type = get_relation_type(db, table_name)
         relation_type_name = case relation_type
-                             when :table then "table"
+                             when :table then "table" # Added table case for completeness
                              when :view then "view"
                              when :materialized_view then "materialized view"
-                             else "relation"
+                             else "relation" # Default case
                              end
         
-        print_info "Analyzing #{relation_type_name}: #{relation_name_string}", :cyan, :bold
+        print_info "Analyzing #{relation_type_name}: #{table_name}", :cyan, :bold
         adapter_type = db.database_type
         relation_stats = {
           relation_type: relation_type
@@ -55,108 +56,111 @@ module DbReport
         if relation_type == :view || relation_type == :materialized_view
           begin
             # Get view definition (the SQL query that defines the view)
-            view_definition = fetch_view_definition(db, relation_name_string)
+            view_definition = fetch_view_definition(db, table_name)
             relation_stats[:view_definition] = view_definition if view_definition
             
             # Get view dependencies (tables and other views it references)
-            view_dependencies = fetch_view_dependencies(db, relation_name_string)
+            view_dependencies = fetch_view_dependencies(db, table_name)
             relation_stats[:dependencies] = view_dependencies if view_dependencies.any?
             
             # Get materialized view specific info if applicable
             if relation_type == :materialized_view
-              mv_info = fetch_materialized_view_info(db, relation_name_string)
+              mv_info = fetch_materialized_view_info(db, table_name)
               if mv_info
                 relation_stats[:is_materialized] = mv_info[:is_materialized]
                 relation_stats[:last_refresh] = mv_info[:last_refresh]
                 
                 print_debug "  Materialized view last refresh: #{mv_info[:last_refresh]}" if debug && mv_info[:last_refresh]
               end
-            end
+            end # Closes if relation_type == :materialized_view
           rescue => e
-            print_warning "  Could not fetch view metadata for #{relation_name_string}: #{e.message}"
-          end
-        end
-
-        table_stats = {}
+            print_warning "  Could not fetch view metadata for #{table_name}: #{e.message}"
+          end # Closes begin/rescue for view metadata
+        end # Closes if relation_type is view/mv
+        
+        # The `begin` for the main analysis block starts on the next line
         begin
+          # --- Schema Fetching ---
           columns_schema = fetch_and_enhance_schema(db, relation_identifier)
           return { 
-            error: "Could not fetch schema for #{relation_name_string}",
+            error: "Could not fetch schema for #{table_name}",
             relation_type: relation_type
-          } if columns_schema.empty?
+          } if columns_schema.empty? # Error if no columns found
 
           base_dataset = db[relation_identifier]
-          unique_single_columns = fetch_unique_single_columns(db, relation_name_string)
+          unique_single_columns = fetch_unique_single_columns(db, table_name)
+          
+          # Initialize stats and prepare for aggregation
+          table_stats = {} 
+          initial_col_stats = initialize_column_stats(columns_schema, unique_single_columns)
 
-          # --- Aggregation --- #
+          # --- Aggregation ---
           all_select_parts = [Sequel.function(:COUNT, Sequel.lit('*')).as(:_total_count)]
           initial_col_stats = initialize_column_stats(columns_schema, unique_single_columns)
 
-          # Build all aggregate queries in one pass
+          initial_col_stats = initialize_column_stats(columns_schema, unique_single_columns)
           columns_schema.each do |col_sym, col_info|
-            is_unique = initial_col_stats[col_sym][:is_unique]
-            all_select_parts.concat(build_aggregate_select_parts(col_info[:type], col_sym, adapter_type, is_unique))
+            # Use the correct method name from AggregateFunctions module
+            all_select_parts += build_aggregate_select_parts(col_info[:type], col_sym, adapter_type, initial_col_stats[col_sym][:is_unique])
           end
-
-          # Execute a single aggregate query for all columns
+          # Execute the single aggregate query
           all_agg_results = execute_aggregate_query(base_dataset, all_select_parts)
           total_count = all_agg_results ? all_agg_results[:_total_count].to_i : 0
 
-          # --- Populate Stats & Frequency --- #
-          columns_schema.each do |column_sym, column_info|
-            col_stats = initial_col_stats[column_sym]
-            print_info "  - Analyzing column: #{column_sym} (#{col_stats[:type]}/#{col_stats[:db_type]})#{col_stats[:is_unique] ? ' (unique)' : ''}", :white
+          # Parse aggregate results back into column stats
+          populate_stats_from_aggregates(all_agg_results, initial_col_stats, total_count) if total_count > 0
 
-            col_stats[:count] = total_count
-            populate_stats_from_aggregates(col_stats, all_agg_results, column_info[:type], column_sym, total_count) if all_agg_results
-          end
-
+          # --- Frequency Analysis ---
           # Batch analyze frequencies for all columns in one go
           print_debug "  Batch analyzing column frequencies..." if debug
-          batch_analyze_frequencies(initial_col_stats, base_dataset, columns_schema, unique_single_columns)
+          # Pass relation_type to frequency analyzer for view optimizations
+          batch_analyze_frequencies(initial_col_stats, base_dataset, columns_schema, unique_single_columns, relation_type)
 
+          # --- Value Searching ---
           # Search for specific value if provided in options
           if options[:search_value]
             print_debug "  Searching for value: #{options[:search_value]}..." if debug
-            search_for_value_in_table(table_name_string, columns_schema, options[:search_value], initial_col_stats)
+            search_for_value_in_table(table_name, columns_schema, options[:search_value], initial_col_stats)
           end
+          # --- Final Cleanup ---
           # Clean up and store final stats
           columns_schema.each do |column_sym, _|
             col_stats = initial_col_stats[column_sym]
-            col_stats.delete_if { |_key, value| value.nil? || value == {} }
+            col_stats.delete_if { |_key, value| value.nil? || value == {} || value == [] }
             table_stats[column_sym.to_s] = col_stats
           end
           
           # Merge column stats with relation stats
           relation_stats.merge!(table_stats)
 
+          # --- Error Handling ---
         rescue Sequel::DatabaseError => e
-          msg = "Schema/#{relation_type_name.capitalize} Error for '#{relation_name_string}': #{e.message.lines.first.strip}"
+          msg = "Schema/#{relation_type_name.capitalize} Error for '#{table_name}': #{e.message.lines.first.strip}"
           puts colored_output(msg, :red)
-          return { 
+          return {
             error: msg,
             relation_type: relation_type
           }
         rescue StandardError => e
-          msg = "Unexpected error analyzing #{relation_type_name} '#{relation_name_string}': #{e.message}"
+          msg = "Unexpected error analyzing #{relation_type_name} '#{table_name}': #{e.message}"
           puts colored_output(msg, :red)
-          puts e.backtrace.join("\n") if debug
-          return { 
+          puts e.backtrace.join("\n") if $debug
+          return {
             error: msg,
             relation_type: relation_type 
           }
-        end
-
+        end # Closes outer begin/rescue
         relation_stats
-      end
+      end # Closes analyze_relation method
 
-      # Search for a specific value in a given table and its columns
-      # Using optimized search with UNIONs for compatible column types
+      # Alias for backward compatibility or potential direct table analysis
+      alias analyze_table analyze_relation
+
+      # --- Value Searching Methods --- #
+
+      # Search for a value within a specific table/relation across relevant columns
       def search_for_value_in_table(table_name, columns_schema, search_value, col_stats)
         table_identifier = create_sequel_identifier(table_name)
-        is_postgres = db.database_type == :postgres
-
-        # Separate columns that need very specialized handling from those that can use UNION
         union_compatible_columns = []
         special_columns = []
 

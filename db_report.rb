@@ -68,7 +68,10 @@ class DbReportApp
       connect_timeout: DbReport::Utils::DEFAULT_CONNECT_TIMEOUT,
       parallel: true,
       parallel_processes: nil,
-      search_value: nil
+      search_value: nil,
+      include_tables: true,
+      include_views: true,
+      include_materialized_views: true
     }
 
     parser = OptionParser.new do |opts|
@@ -104,6 +107,12 @@ class DbReportApp
         options[:search_value] = v
       end
       opts.on('--debug', 'Show detailed debug information and SQL logging') { options[:debug] = true }
+      opts.separator ""
+      opts.separator "Analysis Scope Options:"
+      opts.on('--[no-]tables', 'Include tables in analysis (default: yes)') { |v| options[:include_tables] = v }
+      opts.on('--[no-]views', 'Include views in analysis (default: yes)') { |v| options[:include_views] = v }
+      opts.on('--[no-]materialized-views', '--[no-]mvs', 'Include materialized views in analysis (default: yes)') { |v| options[:include_materialized_views] = v }
+      opts.separator ""
       opts.on('-h', '--help', 'Show this help message') { puts opts; exit }
     end
 

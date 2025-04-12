@@ -23,17 +23,22 @@ module DbReport
         end
 
         report_data[:tables].each do |table_name, table_data|
-          puts colored_output(&quot;
-Table: #{table_name}&quot;, :cyan, :bold)
+          # Determine title based on relation type
+          title = case table_data[:relation_type]
+                  when :table then "Table"
+                  when :view then "View"
+                  when :materialized_view then "Materialized View"
+                  else "Relation" # Default for unknown types
+                  end
+          puts colored_output("\n#{title}: #{table_name}", :cyan, :bold)
 
-          if table_data.is_a?(Hash) &amp;&amp; table_data[:error]
-            puts colored_output(&quot;Table: #{table_name} - Error: #{table_data[:error]}&quot;, :red)
+          if table_data.is_a?(Hash) && table_data[:error]
+            puts colored_output("#{title}: #{table_name} - Error: #{table_data[:error]}", :red)
             next
           end
-
-          # Check if there&#39;s any valid column data, ignoring metadata keys
-          unless table_data.is_a?(Hash) &amp;&amp; table_data.values.any? { |v| v.is_a?(Hash) &amp;&amp; v.key?(:count) }
-            puts colored_output(&quot;Table: #{table_name} - Skipping malformed data (no valid column stats found)&quot;, :yellow)
+          # Check if there's any valid column data, ignoring metadata keys
+          unless table_data.is_a?(Hash) && table_data.values.any? { |v| v.is_a?(Hash) && v.key?(:count) }
+            puts colored_output("#{title}: #{table_name} - Skipping malformed data (no valid column stats found)", :yellow)
             next
           end
 
@@ -86,11 +91,10 @@ Table: #{table_name}&quot;, :cyan, :bold)
             # Print most frequent value if present
             if formatted[:most_frequent]&amp;.any?
               top_val, top_count = formatted[:most_frequent].first
-              puts &quot;    Most Frequent: #{truncate_value(top_val)} (#{top_count} times)&quot;
+              puts "    Most Frequent: #{truncate_value(top_val)} (#{top_count} times)"
             end
-          end
-        end
-
+          end # Closes column_data.each
+        end # Closes report_data[:tables].each
 
         # Add search summary at the end of the report
         search_summary_data = DbReport::Utils.generate_search_summary(report_data)

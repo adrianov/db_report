@@ -26,16 +26,46 @@ module DbReport
         end
 
         report_data[:tables].each do |table_name, table_data|
-          puts &quot;\n## Table: #{table_name}&quot;
+          # Determine title based on relation type
+          title = case table_data[:relation_type]
+                  when :table then "Table"
+                  when :view then "View"
+                  when :materialized_view then "Materialized View"
+                  else "Relation" # Default for unknown types
+                  end
+          puts "\n## #{title}: #{table_name}"
+          # Display relation type and view-specific info
+          rel_type = table_data[:relation_type]&.to_s&.capitalize
+          puts "- **Type:** #{rel_type}" if rel_type
 
-          if table_data.is_a?(Hash) &amp;&amp; table_data[:error]
-            puts &quot;  - Error: #{table_data[:error]}&quot;
+          if [:view, :materialized_view].include?(table_data[:relation_type])
+            if table_data[:view_definition]
+              puts "- **Definition:**"
+              # Use the utility function for truncation
+              puts "```sql\n#{DbReport::Utils.truncate_value(table_data[:view_definition], 200)}\n```"
+            end
+            if table_data[:dependencies]&.any?
+              puts "- **Dependencies:** #{table_data[:dependencies].join(', ')}"
+            end
+            if table_data[:is_materialized] && table_data[:last_refresh]
+              # Ensure time is formatted nicely if it's a Time object
+              refresh_time = table_data[:last_refresh].is_a?(Time) ? table_data[:last_refresh].iso8601 : table_data[:last_refresh]
+              puts "- **Last Refresh:** #{refresh_time}"
+            end
+          end
+
+          if table_data.is_a?(Hash) && table_data[:error]
+            puts "  - Error: #{table_data[:error]}"
             next
           end
 
           # Check if there&#39;s any valid column data, ignoring metadata keys
-          unless table_data.is_a?(Hash) &amp;&amp; table_data.values.any? { |v| v.is_a?(Hash) &amp;&amp; v.key?(:count) }
-            puts &quot;  - Skipping malformed data for table (no valid column stats found): #{table_name}&quot;
+          # Note: The check below implicitly handles the error case above as well
+          unless table_data.is_a?(Hash) && table_data.values.any? { |v| v.is_a?(Hash) && v.key?(:count) }
+            # If there's no error key but still no valid columns, then skip
+            unless table_data.is_a?(Hash) && table_data[:error]
+              puts "  - Skipping malformed data for relation (no valid column stats found): #{table_name}"
+            end
             next
           end
 

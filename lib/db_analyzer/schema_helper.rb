@@ -62,10 +62,10 @@ module DbReport
       end
 
       # Fetch columns with unique indexes
-      def fetch_unique_single_columns(db, table_name_string)
+      def fetch_unique_single_columns(db, relation_name_string)
         unique_columns = Set.new
         begin
-          parsed_ident = parse_table_identifier(table_name_string)
+          parsed_ident = parse_table_identifier(relation_name_string)
           index_opts = parsed_ident[:schema] ? { schema: parsed_ident[:schema] } : {}
           indexes = db.indexes(parsed_ident[:table], index_opts)
 
@@ -75,14 +75,14 @@ module DbReport
           print_debug "  Found unique single-column indexes on: #{unique_columns.to_a.join(', ')}" if unique_columns.any? && $debug
         rescue NotImplementedError
           print_debug "  Index fetching not implemented for this adapter."
+          print_debug "  Index fetching not implemented for this adapter."
         rescue Sequel::DatabaseError => e
-          print_warning "  Could not fetch index information for #{table_name_string}: #{e.message}"
+          print_warning "  Could not fetch index information for #{relation_name_string}: #{e.message}"
         rescue StandardError => e
-          print_warning "  Unexpected error fetching indexes for #{table_name_string}: #{e.message}"
-        end
+          print_warning "  Unexpected error fetching indexes for #{relation_name_string}: #{e.message}"
+        end # Closes begin/rescue block
         unique_columns
       end
-
       # Initialize the column statistics structure
       def initialize_column_stats(columns_schema, unique_single_columns)
         stats = {}
@@ -102,9 +102,7 @@ module DbReport
       end
       # Determine which tables to analyze based on options and available tables
       def select_tables_to_analyze(db, options)
-        # Include views flag
-        include_views = options[:include_views] || false
-        include_materialized_views = options[:include_materialized_views] || false
+        # Options controlling inclusion will be accessed directly via options hash
         
         all_qualified_tables = fetch_all_qualified_tables(db)
         tables_in_search_path = fetch_tables_in_search_path(db)
@@ -128,30 +126,28 @@ module DbReport
         
         if user_requested_tables.empty?
           # Apply filtering based on options
-          print_debug("Including regular tables in analysis") if $debug
           
-          # Filter based on relation type
-          if !include_views && !include_materialized_views
-            # Only include regular tables
-            print_debug("Excluding views and materialized views from analysis") if $debug
-            filtered_tables = filtered_tables.select { |t| t[:type] == :table }
-          elsif !include_views
-            # Include tables and materialized views, but not regular views
-            print_debug("Excluding views from analysis") if $debug
-            filtered_tables = filtered_tables.select { |t| t[:type] != :view }
-          elsif !include_materialized_views
-            # Include tables and regular views, but not materialized views
-            print_debug("Excluding materialized views from analysis") if $debug
-            filtered_tables = filtered_tables.select { |t| t[:type] != :materialized_view }
-          else
-            # Include all types (tables, views, materialized views)
-            print_debug("Including all relation types in analysis: tables, views, and materialized views") if $debug
+          # Filter based on relation type using options
+          filtered_tables = filtered_tables.select do |t|
+            case t[:type]
+            when :table
+              options[:include_tables]
+            when :view
+              options[:include_views]
+            when :materialized_view
+              options[:include_materialized_views]
+            else
+              false # Exclude unknown types
+            end
           end
-          
-          tables_to_analyze = determine_default_tables(
-            tables_in_search_path, 
-            filtered_tables.map { |t| t[:name] }
-          )
+          if $debug
+          end
+          if $debug
+            print_debug("Filtering relations based on options: tables=#{options[:include_tables]}, views=#{options[:include_views]}, mvs=#{options[:include_materialized_views]}")
+          end
+
+          # Use the already filtered list directly for default analysis
+          tables_to_analyze = filtered_tables.map { |t| t[:name] } # Use all filtered relations directly
         else
           # User explicitly requested tables - check if they exist and resolve them
           tables_to_analyze, invalid_tables = resolve_user_requested_tables(
@@ -161,44 +157,29 @@ module DbReport
             all_qualified_tables
           )
           
-          # Apply view filtering only if options are specified
-          if !include_views || !include_materialized_views
-            # Filter user-requested tables based on relation type
-            tables_to_analyze = tables_to_analyze.select do |qualified_name|
-              rel_type = get_relation_type(db, qualified_name)
-              
-              case rel_type
-              when :view
-                if !include_views
-                  print_debug("Excluding view from analysis: #{qualified_name}") if $debug
-                  false
-                else
-                  true
-                end
-              when :materialized_view
-                if !include_materialized_views
-                  print_debug("Excluding materialized view from analysis: #{qualified_name}") if $debug
-                  false
-                else
-                  true
-                end
-              else
-                true
-              end
-            end
-          end
-        end
-        
+          # Filter user-requested tables based on options
+          tables_to_analyze = tables_to_analyze.select do |qualified_name|
+            rel_type = get_relation_type(db, qualified_name)
+            included = case rel_type
+                       when :table
+                         options[:include_tables]
+                       when :view
+                         options[:include_views]
+                       when :materialized_view
+                         options[:include_materialized_views]
+                       else
+                         false # Exclude unknown types
+                       end
+            print_debug("Excluding #{rel_type} #{qualified_name} based on options") if !included && $debug
+            included
+          end # Closes the select block
+        end # Closes the else block (user_requested_tables)
+
         if invalid_tables.any?
           print_warning "Requested tables not found or could not be resolved: #{invalid_tables.uniq.join(', ')}. Available references: #{available_table_references.to_a.sort.join(', ')}"
         end
 
         if tables_to_analyze.empty?
-          msg = user_requested_tables.empty? ? "No application tables found." : "No valid tables specified or found among available references."
-          available_refs_msg = available_table_references.any? ? " Available references: #{available_table_references.to_a.sort.join(', ')}" : ""
-          abort_with_error "#{msg}#{available_refs_msg}"
-        end
-        # Add view type information in debug output
         if $debug
           tables_to_analyze.each do |qualified_name|
             rel_type = get_relation_type(db, qualified_name)
@@ -213,7 +194,8 @@ module DbReport
               print_debug("#{qualified_name} has UNKNOWN type")
             end
           end
-        end
+        end # Closes if $debug
+        end # Closes if tables_to_analyze.empty?
         
         print_info "
 Analyzing #{tables_to_analyze.length} relation(s): #{tables_to_analyze.join(', ')}"

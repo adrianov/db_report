@@ -137,15 +137,18 @@ module DbReport
       end
 
       # Populate column stats from aggregate query results
-      def populate_stats_from_aggregates(col_stats, agg_results, column_type, column_sym, total_count)
-        return unless agg_results # Guard against nil results
+      # Populate column stats from aggregate query results
+      def populate_stats_from_aggregates(all_agg_results, initial_col_stats, total_count)
+        return unless all_agg_results # Guard against nil results
 
-        # Early return for tsvector type - only set basic counts
+        initial_col_stats.each_key do |column_sym|
+          col_stats = initial_col_stats[column_sym]
+          column_type = col_stats[:type].to_sym rescue nil
         if column_type == :tsvector
           non_null_key = :"non_null_count_#{column_sym}"
-          non_null_count = agg_results[non_null_key].to_i
+          non_null_count = all_agg_results[non_null_key].to_i # Use correct variable
           col_stats[:null_count] = total_count - non_null_count
-          return
+          next # Skip to next column, don't exit method
         end
 
         non_null_key = :"non_null_count_#{column_sym}"
@@ -155,17 +158,17 @@ module DbReport
         true_count_key = :"true_count_#{column_sym}"
         distinct_count_key = :"distinct_count_#{column_sym}"
 
-        non_null_count = agg_results[non_null_key].to_i
+        non_null_count = all_agg_results[non_null_key].to_i
         col_stats[:null_count] = total_count - non_null_count
-        col_stats[:min] = agg_results[min_key]
-        col_stats[:max] = agg_results[max_key]
-        col_stats[:distinct_count] = agg_results[distinct_count_key].to_i if agg_results.key?(distinct_count_key)
+        col_stats[:min] = all_agg_results[min_key]
+        col_stats[:max] = all_agg_results[max_key]
+        col_stats[:distinct_count] = all_agg_results[distinct_count_key].to_i if all_agg_results.key?(distinct_count_key)
 
         if column_type == :boolean && non_null_count > 0
-          true_count = agg_results[true_count_key].to_i
+          true_count = all_agg_results[true_count_key].to_i
           col_stats[:true_percentage] = (true_count.to_f / non_null_count) * 100
-        elsif agg_results[avg_key]
-          col_stats[:avg] = agg_results[avg_key].to_f rescue nil
+        elsif all_agg_results.key?(avg_key) && all_agg_results[avg_key] # Check key existence too
+          col_stats[:avg] = all_agg_results[avg_key].to_f rescue nil
         end
 
         # Format date/time (Sequel often returns objects)
@@ -173,6 +176,7 @@ module DbReport
           col_stats[:min] = col_stats[:min].iso8601 rescue col_stats[:min].to_s if col_stats[:min].respond_to?(:iso8601)
           col_stats[:max] = col_stats[:max].iso8601 rescue col_stats[:max].to_s if col_stats[:max].respond_to?(:iso8601)
         end
+       end # Closes initial_col_stats.each_key
       end
 
       # Make module methods available as instance methods

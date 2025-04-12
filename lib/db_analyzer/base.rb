@@ -78,7 +78,29 @@ module DbReport
           end # Closes begin/rescue for view metadata
         end # Closes if relation_type is view/mv
         
-        # The `begin` for the main analysis block starts on the next line
+        # --- Schema Fetching (Basic for --schema-only or full analysis) ---
+        begin
+          columns_schema = fetch_and_enhance_schema(db, relation_identifier)
+        rescue => e
+          print_warning("Could not fetch schema for #{table_name}: #{e.message}")
+          return { error: "Schema fetch failed: #{e.message}", relation_type: relation_type } # Include type in error
+        end
+        
+        # Add basic column schema info to results
+        columns_schema.each do |col_sym, col_info|
+          relation_stats[col_sym] = { type: col_info[:type].to_s, db_type: col_info[:db_type] }
+        end
+
+        # If only schema is requested, return early
+        # Use instance variable @options directly as it's set in initialize
+        if @options[:schema_only]
+          print_debug("  --schema-only mode: Skipping aggregates, frequency, and search for #{table_name}") if $debug
+          # Add schema_only flag to the result for reporter identification
+          relation_stats[:schema_only] = true
+          return relation_stats # Return schema + view metadata + schema_only flag
+        end
+
+        # --- Full Analysis (if not --schema-only) ---
         begin
           # --- Schema Fetching ---
           columns_schema = fetch_and_enhance_schema(db, relation_identifier)
@@ -137,20 +159,15 @@ module DbReport
         rescue Sequel::DatabaseError => e
           msg = "Schema/#{relation_type_name.capitalize} Error for '#{table_name}': #{e.message.lines.first.strip}"
           puts colored_output(msg, :red)
-          return {
-            error: msg,
-            relation_type: relation_type
-          }
+          relation_stats[:error] = msg # Assign error instead of returning
         rescue StandardError => e
           msg = "Unexpected error analyzing #{relation_type_name} '#{table_name}': #{e.message}"
           puts colored_output(msg, :red)
           puts e.backtrace.join("\n") if $debug
-          return {
-            error: msg,
-            relation_type: relation_type 
-          }
-        end # Closes outer begin/rescue
-        relation_stats
+          relation_stats[:error] = msg # Assign error instead of returning
+        end # Closes begin/rescue for full analysis
+
+        relation_stats # Implicit return
       end # Closes analyze_relation method
 
       # Alias for backward compatibility or potential direct table analysis

@@ -1,7 +1,6 @@
-<search/>
 # frozen_string_literal: true
 
-require_relative &#39;../utils&#39;
+require_relative '../utils'
 
 module DbReport
   module Reporter
@@ -11,22 +10,22 @@ module DbReport
 
       def self.format(report_data)
         meta = report_data[:metadata]
-        puts &quot;# Database Analysis Report (GPT Format)&quot;
+        meta = report_data[:metadata]
+        puts "# Database Analysis Report (GPT Format)"
         puts
-        puts &quot;- **Adapter:** #{meta[:database_adapter]}&quot;
-        puts &quot;- **Type:** #{meta[:database_type]}&quot;
-        puts &quot;- **Version:** #{meta[:database_version]}&quot;
-        puts &quot;- **Generated:** #{meta[:generated_at]}&quot;
-        puts &quot;- **Duration:** #{meta[:analysis_duration_seconds]}s&quot;
-        puts &quot;- **Tables Analyzed:** #{meta[:analyzed_tables].length}&quot;
+        puts "- **Adapter:** #{meta[:database_adapter]}"
+        puts "- **Type:** #{meta[:database_type]}"
+        puts "- **Version:** #{meta[:database_version]}"
+        puts "- **Generated:** #{meta[:generated_at]}"
+        puts "- **Duration:** #{meta[:analysis_duration_seconds]}s"
+        puts "- **Tables Analyzed:** #{meta[:analyzed_tables].length}"
 
         # Display search value if it was used
         if meta[:search_value]
-          puts &quot;- **Search Value:** #{meta[:search_value]}&quot;
+          puts "- **Search Value:** #{meta[:search_value]}"
         end
 
         report_data[:tables].each do |table_name, table_data|
-          # Determine title based on relation type
           title = case table_data[:relation_type]
                   when :table then "Table"
                   when :view then "View"
@@ -49,34 +48,42 @@ module DbReport
             end
             if table_data[:is_materialized] && table_data[:last_refresh]
               # Ensure time is formatted nicely if it's a Time object
-              refresh_time = table_data[:last_refresh].is_a?(Time) ? table_data[:last_refresh].iso8601 : table_data[:last_refresh]
-              puts "- **Last Refresh:** #{refresh_time}"
+          if table_data.is_a?(Hash) && table_data.key?(:error) && !table_data[:error].to_s.empty?
+            puts "  - Error: #{table_data[:error].to_s}" # Ensure error is string
+            # If there's an error, don't print schema details below
+            next
+          end # Closes error check
+          # Check if we are in schema-only mode (no aggregate data like :count)
+          is_schema_only = !table_data.values.any? { |v| v.is_a?(Hash) && v.key?(:count) }
+
+          if is_schema_only
+            # --- Schema-Only Output Logic ---
+            puts "- **Mode:** Schema Only"
+            # View Metadata is already printed above the error/schema check
+            # Print Columns
+            puts "- **Columns:**"
+            column_data = table_data.reject { |k, _| DbReport::Utils::METADATA_KEYS.include?(k) }
+            column_data.each do |col_sym, col_info|
+              type_str = if col_info[:type] && col_info[:type] != col_info[:db_type]
+                           "#{col_info[:type]} / #{col_info[:db_type]}"
+                         else
+                           col_info[:db_type]
+                         end
+              puts "  - `#{col_sym}` (#{type_str})"
             end
+            next # Skip the rest of the loop for this relation
           end
 
-          if table_data.is_a?(Hash) && table_data[:error]
-            puts "  - Error: #{table_data[:error]}"
-            next
-          end
-
-          # Check if there&#39;s any valid column data, ignoring metadata keys
-          # Note: The check below implicitly handles the error case above as well
-          unless table_data.is_a?(Hash) && table_data.values.any? { |v| v.is_a?(Hash) && v.key?(:count) }
-            # If there's no error key but still no valid columns, then skip
-            unless table_data.is_a?(Hash) && table_data[:error]
-              puts "  - Skipping malformed data for relation (no valid column stats found): #{table_name}"
-            end
-            next
-          end
+          # --- Existing Full Analysis Output Logic Continues Below ---
+          # --- Existing Full Analysis Output Logic Continues Below ---
 
           # Filter out metadata keys before counting columns and getting row count
-          column_data = table_data.reject { |k, _| METADATA_KEYS.include?(k) }
           column_count = column_data.keys.length
           first_col_stats = column_data.values.first || {}
-          row_count = first_col_stats[:count] || &#39;N/A&#39;
-          puts &quot;\n- **Rows:** #{row_count}&quot;
-          puts &quot;- **Columns:** #{column_count}&quot;
-          puts &quot;### Columns Details:&quot;
+          row_count = first_col_stats[:count] || 'N/A'
+          puts "\n- **Rows:** #{row_count}"
+          puts "- **Columns:** #{column_count}"
+          puts "### Columns Details:"
 
           # Iterate only over actual column data
           column_data.each do |column_name, stats|
@@ -87,48 +94,48 @@ module DbReport
             type_str = if type_part.empty? || type_part == db_type_part
                          db_type_part
                        else
-                         &quot;#{type_part} / #{db_type_part}&quot;
+                         "#{type_part} / #{db_type_part}"
                        end
 
-            found_marker = stats[:found] ? &quot; [FOUND]&quot; : &quot;&quot;
-            puts &quot;- **`#{column_name}`**#{found_marker}&quot;
-            puts &quot;    - Type: #{type_str}&quot;
+            found_marker = stats[:found] ? " [FOUND]" : ""
+            puts "- **`#{column_name}`**#{found_marker}"
+            puts "    - Type: #{type_str}"
 
             null_count = stats[:null_count].to_i
             total_count = stats[:count].to_i
             null_perc_str = if total_count.positive?
-                              &quot;(#{ (null_count.to_f / total_count * 100).round(1) }%)&quot;
+                              "(#{ (null_count.to_f / total_count * 100).round(1) }%)"
                             else
-                              &#39;&#39;
+                              ''
                             end
-            puts &quot;    - Nulls: #{null_count} #{null_perc_str}&quot;
+            puts "    - Nulls: #{null_count} #{null_perc_str}"
 
-            if stats[:distinct_count] &amp;&amp; stats[:distinct_count].to_i &gt; 0
-              puts &quot;    - Distinct Values: #{stats[:distinct_count]} #{stats[:is_unique] ? &#39;(Unique)&#39; : &#39;&#39;}&quot;
+            if stats[:distinct_count] && stats[:distinct_count].to_i > 0
+              puts "    - Distinct Values: #{stats[:distinct_count]} #{stats[:is_unique] ? '(Unique)' : ''}"
             elsif stats[:is_unique]
-               puts &quot;    - Distinct Values: (Unique - count matches rows)&quot;
+               puts "    - Distinct Values: (Unique - count matches rows)"
             end
 
             # Include search value finding in the report
-            if stats[:found] &amp;&amp; stats[:search_value]
-              puts &quot;    - **Search Value Found:** &#39;#{stats[:search_value]}&#39;&quot;
+            if stats[:found] && stats[:search_value]
+              puts "    - **Search Value Found:** '#{stats[:search_value]}'"
             end
 
             # Add simplified stats based on type (more concise for GPT)
             formatted = DbReport::Utils.format_stats_for_summary(stats)
             stat_parts = [] # Collect key stats
             stat_parts << "Min: #{truncate_value(formatted[:min], 40)}" if formatted.key?(:min)
-            stat_parts &lt;&lt; &quot;Max: #{truncate_value(formatted[:max], 40)}&quot; if formatted.key?(:max)
-            stat_parts &lt;&lt; &quot;Avg: #{formatted[:average]}&quot; if formatted.key?(:average)
-            stat_parts &lt;&lt; &quot;AvgLen: #{formatted[:avg_length]}&quot; if formatted.key?(:avg_length)
-            stat_parts &lt;&lt; &quot;AvgItems: #{formatted[:avg_items]}&quot; if formatted.key?(:avg_items)
-            stat_parts &lt;&lt; &quot;True%: #{formatted[:true_percentage]}&quot; if formatted.key?(:true_percentage)
+            stat_parts << "Max: #{truncate_value(formatted[:max], 40)}" if formatted.key?(:max)
+            stat_parts << "Avg: #{formatted[:average]}" if formatted.key?(:average)
+            stat_parts << "AvgLen: #{formatted[:avg_length]}" if formatted.key?(:avg_length)
+            stat_parts << "AvgItems: #{formatted[:avg_items]}" if formatted.key?(:avg_items)
+            stat_parts << "True%: #{formatted[:true_percentage]}" if formatted.key?(:true_percentage)
 
-            puts &quot;    - Stats: #{stat_parts.join(&#39;, &#39;)}&quot; unless stat_parts.empty?
+            puts "    - Stats: #{stat_parts.join(', ')}" unless stat_parts.empty?
 
-            if formatted[:most_frequent]&amp;.any?
+            if formatted[:most_frequent]&.any?
                top_val, top_count = formatted[:most_frequent].first
-               puts &quot;    - Most Frequent: #{truncate_value(top_val, 40)} (#{top_count})&quot;
+               puts "    - Most Frequent: #{truncate_value(top_val, 40)} (#{top_count})"
             end
           end
         end

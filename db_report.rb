@@ -71,11 +71,11 @@ class DbReportApp
       search_value: nil,
       include_tables: true,
       include_views: true,
-      include_materialized_views: true
+      include_materialized_views: true,
+      schema_only: false
     }
 
     parser = OptionParser.new do |opts|
-      opts.banner = "Usage: #{$PROGRAM_NAME} [options]"
 
       opts.on('-d', '--database-url URL', 'Database connection URL (Sequel format, overrides config)') do |url|
         options[:database_url] = url
@@ -110,9 +110,10 @@ class DbReportApp
       opts.separator ""
       opts.separator "Analysis Scope Options:"
       opts.on('--[no-]tables', 'Include tables in analysis (default: yes)') { |v| options[:include_tables] = v }
-      opts.on('--[no-]views', 'Include views in analysis (default: yes)') { |v| options[:include_views] = v }
       opts.on('--[no-]materialized-views', '--[no-]mvs', 'Include materialized views in analysis (default: yes)') { |v| options[:include_materialized_views] = v }
+      opts.on('--schema-only', 'Only output schema information (no aggregates, frequency, or search)') { |v| options[:schema_only] = v }
       opts.separator ""
+      opts.on('-h', '--help', 'Show this help message') { puts opts; exit }
       opts.on('-h', '--help', 'Show this help message') { puts opts; exit }
     end
 
@@ -275,6 +276,8 @@ Available databases (from current connection's perspective):", :green, :bold
 
     # Add search_value to metadata if provided
     metadata[:search_value] = options[:search_value] if options[:search_value]
+    # Add schema_only status to metadata for easy checking in reporters
+    metadata[:schema_only] = options[:schema_only]
 
     {
       metadata: metadata,

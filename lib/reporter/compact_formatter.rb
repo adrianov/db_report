@@ -1,8 +1,7 @@
-<search/>
 # frozen_string_literal: true
 
-require &#39;terminal-table&#39;
-require_relative &#39;../utils&#39;
+require 'terminal-table'
+require_relative '../utils'
 
 module DbReport
   module Reporter
@@ -14,28 +13,28 @@ module DbReport
         meta = report_data[:metadata]
 
         # Print title manually before the table
-        puts colored_output(&quot;Database Analysis Summary&quot;, :magenta, :bold)
+        puts colored_output("Database Analysis Summary", :magenta, :bold)
 
         # Print Metadata Table - no borders and left-aligned
         metadata_table = Terminal::Table.new do |t|
-          t.headings = [&#39;Parameter&#39;, &#39;Value&#39;]
+          t.headings = ['Parameter', 'Value']
           rows = [
-            [&#39;Adapter&#39;, meta[:database_adapter]],
-            [&#39;Type&#39;, meta[:database_type]],
-            [&#39;Version&#39;, meta[:database_version]],
-            [&#39;Generated&#39;, meta[:generated_at]],
-            [&#39;Duration&#39;, &quot;#{meta[:analysis_duration_seconds]}s&quot;],
-            [&#39;Tables Analyzed&#39;, meta[:analyzed_tables].length]
+            ['Adapter', meta[:database_adapter]],
+            ['Type', meta[:database_type]],
+            ['Version', meta[:database_version]],
+            ['Generated', meta[:generated_at]],
+            ['Duration', "#{meta[:analysis_duration_seconds]}s"],
+            ['Tables Analyzed', meta[:analyzed_tables].length]
           ]
 
           # Add search value to metadata table if present
-          rows &lt;&lt; [&#39;Search Value&#39;, meta[:search_value]] if meta[:search_value]
+          rows << ['Search Value', meta[:search_value]] if meta[:search_value]
 
           t.rows = rows
           t.style = {
-            border_x: &quot;&quot;,
-            border_y: &quot; &quot;,
-            border_i: &quot; &quot;,
+            border_x: "",
+            border_y: " ",
+            border_i: " ",
             border_top: false,
             border_bottom: false,
             border_left: false,
@@ -44,98 +43,105 @@ module DbReport
         end
 
         # Modify the rendering to remove heading separator line and extra empty lines
-        rendered_table = metadata_table.to_s.split(&quot;\n&quot;)
+        rendered_table = metadata_table.to_s.split("\n")
         cleaned_lines = []
 
         # Process each line
         rendered_table.each_with_index do |line, i|
           # Skip separator line (usually the second line in the rendered table)
-          next if i == 1 &amp;&amp; (line.include?(&#39;─&#39;) || line.include?(&#39;-&#39;) || line.strip.empty?)
+          next if i == 1 && (line.include?('─') || line.include?('-') || line.strip.empty?)
           # Skip empty or space-only lines
           next if line.strip.empty?
           # Remove leading space that forms the left border
-          line = line.sub(/^ /, &#39;&#39;)
-          cleaned_lines &lt;&lt; line
+          line = line.sub(/^ /, '')
+          cleaned_lines << line
         end
 
-        puts cleaned_lines.join(&quot;\n&quot;)
+        puts cleaned_lines.join("\n")
         puts # Add space after metadata table
 
         # Print Table Summaries
         report_data[:tables].each do |table_name, table_data|
           puts # Add space before each table
 
-          if table_data.is_a?(Hash) &amp;&amp; table_data[:error]
-            puts colored_output(&quot;Table: #{table_name} - Error: #{table_data[:error]}&quot;, :red)
+          if table_data.is_a?(Hash) && table_data.key?(:error) && !table_data[:error].to_s.empty?
+            puts colored_output("Table: #{table_name} - Error: #{table_data[:error].to_s}", :red) # Ensure error is string
             next
           end
+          # Schema-only check is now done in lib/reporter.rb
+          # Determine title and row_count/indicator based on full data
+          # This block will only be entered if it's NOT schema-only mode.
+          # is_schema_only = !table_data.values.any? { |v| v.is_a?(Hash) && v.key?(:count) }
+          has_count_data = true # Assume full data here
 
-          # Check if there&#39;s any valid column data, ignoring metadata keys
-          unless table_data.is_a?(Hash) &amp;&amp; table_data.values.any? { |v| v.is_a?(Hash) &amp;&amp; v.key?(:count) }
-            puts colored_output(&quot;Table: #{table_name} - Skipping malformed data (no valid column stats found)&quot;, :yellow)
-            next
-          end
-
-          # Filter out metadata keys before getting row count
-          column_data = table_data.reject { |k, _| METADATA_KEYS.include?(k) }
-          first_col_stats = column_data.values.first || {}
-          row_count = first_col_stats[:count] || 'N/A'
-
-          # Determine title based on relation type
+          # Determine title and row_count/indicator
           title = case table_data[:relation_type]
-                  when :table then "Table"
-                  when :view then "View"
                   when :materialized_view then "Materialized View"
                   else "Relation"
                   end
-          relation_header_title = "#{title}: #{table_name} (Rows: #{row_count})"
+          row_count_str = has_count_data ? (table_data.values.find { |v| v.is_a?(Hash) && v.key?(:count) }&.dig(:count) || 'N/A') : '(Schema Only)'
+          relation_header_title = "#{title}: #{table_name} (Rows: #{row_count_str})"
 
-          # Prepare data before creating the table
+          # Filter out metadata keys to get column data
+          # Filter out metadata keys to get column data
+          column_data = table_data.reject { |k, _| DbReport::Utils::METADATA_KEYS.include?(k) }
+
+          # --- Full Analysis Output Logic (Schema-only handled in reporter.rb) ---
+          # Removed DEBUG message
           all_rows_data = []
-          initial_headers = [&#39;Column&#39;, &#39;Type&#39;, &#39;Nulls (%)&#39;, &#39;Distinct&#39;, &#39;Stats&#39;, &#39;Found&#39;]
+          initial_headers = ['Column', 'Type', 'Nulls (%)', 'Distinct', 'Stats', 'Found']
+          # Use the row_count_str determined earlier
+          # Ensure row_count_str is fetched correctly even if this module is somehow called directly
+          # Note: This module is intended to be used via Reporter#print_compact_summary
+          row_count_from_first_col = table_data.values.find { |v| v.is_a?(Hash) && v.key?(:count) }&.dig(:count) || 0
 
-          # Iterate only over actual column data
-          column_data.each do |column_name, stats|
-            next unless stats.is_a?(Hash)
+          column_data.each do |col_sym, col_info|
+            stats = table_data[col_sym] # Get the full stats hash, col_info might be just basic schema
+            next unless stats.is_a?(Hash) # Ensure we have stats data
 
-            type_str = stats[:db_type].to_s
+            # Calculate display strings
+            type_str = if stats[:type] && stats[:type] != stats[:db_type]
+                         "#{stats[:type]} / #{stats[:db_type]}"
+                       else
+                         stats[:db_type]
+                       end
             null_count = stats[:null_count].to_i
-            total_count = stats[:count].to_i
-            null_perc_str = total_count.positive? ? &quot;#{null_count} (#{(null_count.to_f / total_count * 100).round(1)}%)&quot; : &quot;#{null_count}&quot;
-            distinct_str = stats[:distinct_count] ? "#{stats[:distinct_count]}#{stats[:is_unique] ? ' (U)' : ''}" : ''
+            null_perc_str = row_count_from_first_col.positive? ? "#{(null_count * 100.0 / row_count_from_first_col).round(1)}%" : "N/A"
+            distinct_str = if stats[:distinct_count]
+                             "#{stats[:distinct_count]}#{stats[:is_unique] ? ' (U)' : ''}"
+                           else
+                             ''
+                           end
 
+            # Format aggregate stats
+            # Use DbReport::Utils.format_stats_for_summary directly if module used standalone
             formatted = DbReport::Utils.format_stats_for_summary(stats)
-
-            # Create combined stats string
             stats_parts = []
-            stats_parts &lt;&lt; &quot;Min: #{truncate_value(formatted[:min], 15)}&quot; if formatted[:min]
-            stats_parts &lt;&lt; &quot;Max: #{truncate_value(formatted[:max], 15)}&quot; if formatted[:max]
-            stats_parts &lt;&lt; &quot;Avg: #{formatted[:average]}&quot; if formatted[:average]
-            stats_parts &lt;&lt; &quot;AvgLen: #{formatted[:avg_length]}&quot; if formatted[:avg_length]
-            stats_parts &lt;&lt; &quot;True%: #{formatted[:true_percentage]}&quot; if formatted[:true_percentage]
-            stats_parts &lt;&lt; &quot;AvgItems: #{formatted[:avg_items]}&quot; if formatted[:avg_items]
-
-            # Add most frequent to stats if available
-            if formatted[:most_frequent]&amp;.any?
+            stats_parts << "Min: #{truncate_value(formatted[:min], 15)}" if formatted[:min]
+            stats_parts << "Max: #{truncate_value(formatted[:max], 15)}" if formatted[:max]
+            stats_parts << "Avg: #{formatted[:average]}" if formatted[:average]
+            stats_parts << "AvgLen: #{formatted[:avg_length]}" if formatted[:avg_length]
+            stats_parts << "True%: #{formatted[:true_percentage]}" if formatted[:true_percentage]
+            stats_parts << "AvgItems: #{formatted[:avg_items]}" if formatted[:avg_items]
+            if formatted[:most_frequent]&.any?
               top_val, top_count = formatted[:most_frequent].first
-              stats_parts &lt;&lt; &quot;MostFreq: #{truncate_value(top_val, 15)} (#{top_count})&quot;
+              stats_parts << "MostFreq: #{truncate_value(top_val, 15)} (#{top_count})"
             end
+            stats_str = stats_parts.join(", ")
 
-            stats_str = stats_parts.join(&quot;, &quot;)
+            # Found string
+            found_str = stats[:found] ? colored_output("YES", :green, :bold) : ''
 
-            # Add found value column
-            found_str = formatted[:found] ? colored_output(&quot;YES&quot;, :green, :bold) : &#39;&#39;
-
-            # Collect row data (raw values before colorization where possible for checks)
-            all_rows_data &lt;&lt; [
-              colored_output(column_name.to_s, :yellow), # Color applied here is ok
+            # Add row data
+            all_rows_data << [
+              colored_output(col_sym.to_s, :yellow),
               type_str,
               null_perc_str,
               distinct_str,
               stats_str,
               found_str
             ]
-          end
+          end # Closes column_data.each
 
           next if all_rows_data.empty? # Skip if no data for the table
 
@@ -143,8 +149,8 @@ module DbReport
           empty_column_indices = Set.new
           (1...initial_headers.length).each do |col_index|
             # Check if all values in this column index are empty strings
-            is_empty = all_rows_data.all? { |row| row[col_index].to_s.empty? }
-            empty_column_indices &lt;&lt; col_index if is_empty
+            is_empty = all_rows_data.all? { |row| row[col_index].to_s.strip.empty? }
+            empty_column_indices << col_index if is_empty
           end
 
           # Filter headers and rows based on empty columns
@@ -161,9 +167,9 @@ module DbReport
             t.headings = filtered_headers
             t.rows = filtered_rows
             t.style = {
-              border_x: &quot;&quot;,
-              border_y: &quot; &quot;,
-              border_i: &quot; &quot;,
+              border_x: "",
+              border_y: " ",
+              border_i: " ",
               border_top: false,
               border_bottom: false,
               border_left: false,
@@ -172,21 +178,120 @@ module DbReport
           end
 
           # Modify the rendering to remove heading separator line and empty lines
-          rendered_table = table_summary.to_s.split(&quot;\n&quot;)
+          rendered_table = table_summary.to_s.split("\n")
           cleaned_lines = []
 
           # Process each line
           rendered_table.each_with_index do |line, i|
             # Skip separator line (usually the second line in the rendered table)
-            next if i == 1 &amp;&amp; (line.include?(&#39;─&#39;) || line.include?(&#39;-&#39;) || line.strip.empty?)
+            next if i == 1 && (line.include?('─') || line.include?('-') || line.strip.empty?)
             # Skip empty or space-only lines
             next if line.strip.empty?
             # Remove leading space that forms the left border
-            line = line.sub(/^ /, &#39;&#39;)
-            cleaned_lines &lt;&lt; line
+            line = line.sub(/^ /, '')
+            cleaned_lines << line
           end
 
-          puts cleaned_lines.join(&quot;\n&quot;)
+          puts cleaned_lines.join("\n")
+          puts # Add extra line after each table
+
+          column_data.each do |col_sym, col_info|
+            stats = table_data[col_sym] # Get the full stats hash, col_info might be just basic schema
+            next unless stats.is_a?(Hash) # Ensure we have stats data
+
+            # Calculate display strings
+            type_str = if stats[:type] && stats[:type] != stats[:db_type]
+                         "#{stats[:type]} / #{stats[:db_type]}"
+                       else
+                         stats[:db_type]
+                       end
+            null_count = stats[:null_count].to_i
+            null_perc_str = row_count.positive? ? "#{(null_count * 100.0 / row_count).round(1)}%" : "N/A"
+            distinct_str = if stats[:distinct_count]
+                             "#{stats[:distinct_count]}#{stats[:is_unique] ? ' (U)' : ''}"
+                           else
+                             ''
+                           end
+
+            # Format aggregate stats
+            formatted = DbReport::Utils.format_stats_for_summary(stats)
+            stats_parts = []
+            stats_parts << "Min: #{truncate_value(formatted[:min], 15)}" if formatted[:min]
+            stats_parts << "Max: #{truncate_value(formatted[:max], 15)}" if formatted[:max]
+            stats_parts << "Avg: #{formatted[:average]}" if formatted[:average]
+            stats_parts << "AvgLen: #{formatted[:avg_length]}" if formatted[:avg_length]
+            stats_parts << "True%: #{formatted[:true_percentage]}" if formatted[:true_percentage]
+            stats_parts << "AvgItems: #{formatted[:avg_items]}" if formatted[:avg_items]
+            if formatted[:most_frequent]&.any?
+              top_val, top_count = formatted[:most_frequent].first
+              stats_parts << "MostFreq: #{truncate_value(top_val, 15)} (#{top_count})"
+            end
+            stats_str = stats_parts.join(", ")
+
+            # Found string
+            found_str = stats[:found] ? colored_output("YES", :green, :bold) : ''
+
+            # Add row data
+            all_rows_data << [
+              colored_output(col_sym.to_s, :yellow),
+              type_str,
+              null_perc_str,
+              distinct_str,
+              stats_str,
+              found_str
+            ]
+          end # Closes column_data.each
+
+          next if all_rows_data.empty? # Skip if no data for the table
+
+          # Determine which columns are empty
+          empty_column_indices = Set.new
+          (1...initial_headers.length).each do |col_index|
+            # Check if all values in this column index are empty strings
+            is_empty = all_rows_data.all? { |row| row[col_index].to_s.empty? }
+            empty_column_indices << col_index if is_empty
+          end
+
+          # Filter headers and rows based on empty columns
+          filtered_headers = initial_headers.reject.with_index { |_, index| empty_column_indices.include?(index) }
+          filtered_rows = all_rows_data.map do |row|
+            row.reject.with_index { |_, index| empty_column_indices.include?(index) }
+          end
+
+          # Build table with filtered data
+          table_summary = Terminal::Table.new do |t|
+            # Add header row spanning all columns
+            t.add_row [{ value: relation_header_title, colspan: filtered_headers.length, alignment: :center }]
+            t.add_separator # Add separator after header
+            t.headings = filtered_headers
+            t.rows = filtered_rows
+            t.style = {
+              border_x: "",
+              border_y: " ",
+              border_i: " ",
+              border_top: false,
+              border_bottom: false,
+              border_left: false,
+              border_right: false
+            }
+          end
+
+          # Modify the rendering to remove heading separator line and empty lines
+          rendered_table = table_summary.to_s.split("\n")
+          cleaned_lines = []
+
+          # Process each line
+          rendered_table.each_with_index do |line, i|
+            # Skip separator line (usually the second line in the rendered table)
+            next if i == 1 && (line.include?('─') || line.include?('-') || line.strip.empty?)
+            # Skip empty or space-only lines
+            next if line.strip.empty?
+            # Remove leading space that forms the left border
+            line = line.sub(/^ /, '')
+            cleaned_lines << line
+          end
+
+          puts cleaned_lines.join("\n")
           puts # Add extra line after each table
         end
 
@@ -207,4 +312,3 @@ module DbReport
     end # Closes module CompactFormatter
   end # Closes module Reporter
 end # Closes module DbReport
-

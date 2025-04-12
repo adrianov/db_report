@@ -25,28 +25,68 @@ module DbReport
         $debug = @debug
       end
 
-      # --- Table Selection Logic ---
+      # --- Table and View Selection Logic ---
 
-      # Determine which tables to analyze based on options and available tables
+      # Determine which tables and views to analyze based on options and available objects
       def select_tables_to_analyze
         select_tables_for_analysis(db, options)
       end
 
-      # --- Table Analysis --- #
+      # --- Database Object Analysis --- #
 
-      # Analyze a single table
-      def analyze_table(table_name_string)
-        table_identifier = create_sequel_identifier(table_name_string)
-        print_info "Analyzing table: #{table_name_string}", :cyan, :bold
+      # Analyze a single database object (table, view, or materialized view)
+      def analyze_relation(relation_name_string)
+        relation_identifier = create_sequel_identifier(relation_name_string)
+        relation_type = get_relation_type(db, relation_name_string)
+        relation_type_name = case relation_type
+                             when :table then "table"
+                             when :view then "view"
+                             when :materialized_view then "materialized view"
+                             else "relation"
+                             end
+        
+        print_info "Analyzing #{relation_type_name}: #{relation_name_string}", :cyan, :bold
         adapter_type = db.database_type
+        relation_stats = {
+          relation_type: relation_type
+        }
+        
+        # Add view-specific information if it's a view or materialized view
+        if relation_type == :view || relation_type == :materialized_view
+          begin
+            # Get view definition (the SQL query that defines the view)
+            view_definition = fetch_view_definition(db, relation_name_string)
+            relation_stats[:view_definition] = view_definition if view_definition
+            
+            # Get view dependencies (tables and other views it references)
+            view_dependencies = fetch_view_dependencies(db, relation_name_string)
+            relation_stats[:dependencies] = view_dependencies if view_dependencies.any?
+            
+            # Get materialized view specific info if applicable
+            if relation_type == :materialized_view
+              mv_info = fetch_materialized_view_info(db, relation_name_string)
+              if mv_info
+                relation_stats[:is_materialized] = mv_info[:is_materialized]
+                relation_stats[:last_refresh] = mv_info[:last_refresh]
+                
+                print_debug "  Materialized view last refresh: #{mv_info[:last_refresh]}" if debug && mv_info[:last_refresh]
+              end
+            end
+          rescue => e
+            print_warning "  Could not fetch view metadata for #{relation_name_string}: #{e.message}"
+          end
+        end
+
         table_stats = {}
-
         begin
-          columns_schema = fetch_and_enhance_schema(db, table_identifier)
-          return { error: "Could not fetch schema for #{table_name_string}" } if columns_schema.empty?
+          columns_schema = fetch_and_enhance_schema(db, relation_identifier)
+          return { 
+            error: "Could not fetch schema for #{relation_name_string}",
+            relation_type: relation_type
+          } if columns_schema.empty?
 
-          base_dataset = db[table_identifier]
-          unique_single_columns = fetch_unique_single_columns(db, table_name_string)
+          base_dataset = db[relation_identifier]
+          unique_single_columns = fetch_unique_single_columns(db, relation_name_string)
 
           # --- Aggregation --- #
           all_select_parts = [Sequel.function(:COUNT, Sequel.lit('*')).as(:_total_count)]
@@ -80,26 +120,34 @@ module DbReport
             print_debug "  Searching for value: #{options[:search_value]}..." if debug
             search_for_value_in_table(table_name_string, columns_schema, options[:search_value], initial_col_stats)
           end
-
           # Clean up and store final stats
           columns_schema.each do |column_sym, _|
             col_stats = initial_col_stats[column_sym]
             col_stats.delete_if { |_key, value| value.nil? || value == {} }
             table_stats[column_sym.to_s] = col_stats
           end
+          
+          # Merge column stats with relation stats
+          relation_stats.merge!(table_stats)
 
         rescue Sequel::DatabaseError => e
-          msg = "Schema/Table Error for '#{table_name_string}': #{e.message.lines.first.strip}"
+          msg = "Schema/#{relation_type_name.capitalize} Error for '#{relation_name_string}': #{e.message.lines.first.strip}"
           puts colored_output(msg, :red)
-          return { error: msg }
+          return { 
+            error: msg,
+            relation_type: relation_type
+          }
         rescue StandardError => e
-          msg = "Unexpected error analyzing table '#{table_name_string}': #{e.message}"
+          msg = "Unexpected error analyzing #{relation_type_name} '#{relation_name_string}': #{e.message}"
           puts colored_output(msg, :red)
           puts e.backtrace.join("\n") if debug
-          return { error: msg }
+          return { 
+            error: msg,
+            relation_type: relation_type 
+          }
         end
 
-        table_stats
+        relation_stats
       end
 
       # Search for a specific value in a given table and its columns
@@ -433,30 +481,31 @@ module DbReport
           print_debug "    Error searching for value in #{table_identifier.to_s}.#{column_sym}: #{e.message}" if debug
         end
       end
+      # Alias for backward compatibility
+      alias analyze_table analyze_relation
 
-      # Analyze tables in parallel using multiple processes (default method)
-      def analyze_tables_in_parallel(tables_to_analyze = nil, parallel_processes = nil)
+      # Analyze database objects in parallel using multiple processes (default method)
+      def analyze_tables_in_parallel(relations_to_analyze = nil, parallel_processes = nil)
         begin
           require 'parallel'
         rescue LoadError
           print_warning "The 'parallel' gem is required for parallel analysis but was not found."
           print_warning "Falling back to sequential analysis."
-          return analyze_tables_sequentially(tables_to_analyze)
+          return analyze_tables_sequentially(relations_to_analyze)
         end
 
-        tables_to_analyze ||= select_tables_to_analyze
+        relations_to_analyze ||= select_tables_to_analyze
         # Determine optimal number of workers
-        default_processes = [Parallel.processor_count, tables_to_analyze.size].min
+        default_processes = [Parallel.processor_count, relations_to_analyze.size].min
         parallel_processes ||= options[:parallel_processes] || default_processes
-        parallel_processes = [parallel_processes, tables_to_analyze.size].min
+        parallel_processes = [parallel_processes, relations_to_analyze.size].min
 
-        print_info "Using #{parallel_processes} parallel processes to analyze #{tables_to_analyze.size} tables", :cyan, :bold
+        print_info "Using #{parallel_processes} parallel processes to analyze #{relations_to_analyze.size} database objects", :cyan, :bold
 
         # Initialize database config for connection recreation in child processes
         db_opts = @db.opts.dup
-
         # Run analysis in parallel using processes
-        results = Parallel.map(tables_to_analyze, in_processes: parallel_processes) do |table_name|
+        results = Parallel.map(relations_to_analyze, in_processes: parallel_processes) do |relation_name|
           # Create a new database connection for each process
           process_db = Sequel.connect(db_opts)
           process_db.extension :connection_validator if db.database_type == :postgres
@@ -464,22 +513,43 @@ module DbReport
           # Create a new analyzer instance with the new connection
           analyzer = DbReport::DbAnalyzer::Base.new(process_db, options)
 
-          # Analyze the table and return the result
-          table_result = analyzer.analyze_table(table_name)
+          # Analyze the relation and return the result
+          relation_result = analyzer.analyze_relation(relation_name)
           process_db.disconnect
 
-          [table_name, table_result]
+          [relation_name, relation_result]
         end
 
         # Convert results array to hash
         Hash[results]
       end
+      # Analyze database objects sequentially
+      def analyze_tables_sequentially(relations_to_analyze = nil)
+        relations_to_analyze ||= select_tables_to_analyze
+        relations_to_analyze.each_with_object({}) do |relation_name, results|
+          results[relation_name] = analyze_relation(relation_name)
+        end
+      end
 
-      # Analyze tables sequentially
-      def analyze_tables_sequentially(tables_to_analyze = nil)
-        tables_to_analyze ||= select_tables_to_analyze
-        tables_to_analyze.each_with_object({}) do |table_name, results|
-          results[table_name] = analyze_table(table_name)
+      # Helper method to refresh a materialized view
+      def refresh_materialized_view(view_name)
+        return false unless db.database_type == :postgres
+        
+        begin
+          # Check if it's a materialized view
+          relation_type = get_relation_type(db, view_name)
+          unless relation_type == :materialized_view
+            print_warning "#{view_name} is not a materialized view."
+            return false
+          end
+          
+          # Execute refresh command
+          db.execute("REFRESH MATERIALIZED VIEW #{db.literal(view_name)}")
+          print_info "Successfully refreshed materialized view: #{view_name}", :green
+          return true
+        rescue Sequel::DatabaseError => e
+          print_warning "Error refreshing materialized view #{view_name}: #{e.message}"
+          return false
         end
       end
     end

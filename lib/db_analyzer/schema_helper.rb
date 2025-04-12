@@ -100,9 +100,12 @@ module DbReport
         end
         stats
       end
-
       # Determine which tables to analyze based on options and available tables
       def select_tables_to_analyze(db, options)
+        # Include views flag
+        include_views = options[:include_views] || false
+        include_materialized_views = options[:include_materialized_views] || false
+        
         all_qualified_tables = fetch_all_qualified_tables(db)
         tables_in_search_path = fetch_tables_in_search_path(db)
 
@@ -113,22 +116,79 @@ module DbReport
         if available_table_references.empty?
           abort_with_error 'No tables found in the database (checked schemas and search_path).'
         end
-
         user_requested_tables = options[:tables]
         tables_to_analyze = []
         invalid_tables = []
 
+        # Filter tables based on their type if not explicitly requested by the user
+        filtered_tables = all_qualified_tables.map do |qualified_name|
+          rel_type = get_relation_type(db, qualified_name)
+          { name: qualified_name, type: rel_type }
+        end
+        
         if user_requested_tables.empty?
-          tables_to_analyze = determine_default_tables(tables_in_search_path, all_qualified_tables)
+          # Apply filtering based on options
+          print_debug("Including regular tables in analysis") if $debug
+          
+          # Filter based on relation type
+          if !include_views && !include_materialized_views
+            # Only include regular tables
+            print_debug("Excluding views and materialized views from analysis") if $debug
+            filtered_tables = filtered_tables.select { |t| t[:type] == :table }
+          elsif !include_views
+            # Include tables and materialized views, but not regular views
+            print_debug("Excluding views from analysis") if $debug
+            filtered_tables = filtered_tables.select { |t| t[:type] != :view }
+          elsif !include_materialized_views
+            # Include tables and regular views, but not materialized views
+            print_debug("Excluding materialized views from analysis") if $debug
+            filtered_tables = filtered_tables.select { |t| t[:type] != :materialized_view }
+          else
+            # Include all types (tables, views, materialized views)
+            print_debug("Including all relation types in analysis: tables, views, and materialized views") if $debug
+          end
+          
+          tables_to_analyze = determine_default_tables(
+            tables_in_search_path, 
+            filtered_tables.map { |t| t[:name] }
+          )
         else
+          # User explicitly requested tables - check if they exist and resolve them
           tables_to_analyze, invalid_tables = resolve_user_requested_tables(
             user_requested_tables,
             qualified_set,
             search_path_set,
             all_qualified_tables
           )
+          
+          # Apply view filtering only if options are specified
+          if !include_views || !include_materialized_views
+            # Filter user-requested tables based on relation type
+            tables_to_analyze = tables_to_analyze.select do |qualified_name|
+              rel_type = get_relation_type(db, qualified_name)
+              
+              case rel_type
+              when :view
+                if !include_views
+                  print_debug("Excluding view from analysis: #{qualified_name}") if $debug
+                  false
+                else
+                  true
+                end
+              when :materialized_view
+                if !include_materialized_views
+                  print_debug("Excluding materialized view from analysis: #{qualified_name}") if $debug
+                  false
+                else
+                  true
+                end
+              else
+                true
+              end
+            end
+          end
         end
-
+        
         if invalid_tables.any?
           print_warning "Requested tables not found or could not be resolved: #{invalid_tables.uniq.join(', ')}. Available references: #{available_table_references.to_a.sort.join(', ')}"
         end
@@ -138,9 +198,25 @@ module DbReport
           available_refs_msg = available_table_references.any? ? " Available references: #{available_table_references.to_a.sort.join(', ')}" : ""
           abort_with_error "#{msg}#{available_refs_msg}"
         end
-
+        # Add view type information in debug output
+        if $debug
+          tables_to_analyze.each do |qualified_name|
+            rel_type = get_relation_type(db, qualified_name)
+            case rel_type
+            when :view
+              print_debug("#{qualified_name} is a VIEW")
+            when :materialized_view
+              print_debug("#{qualified_name} is a MATERIALIZED VIEW")
+            when :table
+              print_debug("#{qualified_name} is a TABLE")
+            else
+              print_debug("#{qualified_name} has UNKNOWN type")
+            end
+          end
+        end
+        
         print_info "
-Analyzing #{tables_to_analyze.length} table(s): #{tables_to_analyze.join(', ')}"
+Analyzing #{tables_to_analyze.length} relation(s): #{tables_to_analyze.join(', ')}"
         tables_to_analyze
       end
 
@@ -152,15 +228,22 @@ Analyzing #{tables_to_analyze.length} table(s): #{tables_to_analyze.join(', ')}"
         # TODO: Add support for other adapters (MySQL, SQLite)
         return [] unless db.database_type == :postgres
         query = <<~SQL
-          SELECT n.nspname, c.relname
+          SELECT n.nspname, c.relname, c.relkind
           FROM pg_class c
           JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE c.relkind IN ('r', 'p') -- Regular tables and partitioned tables
+          WHERE c.relkind IN ('r', 'p', 'v', 'm') -- Regular tables, partitioned tables, views, materialized views
             AND n.nspname NOT IN ('pg_catalog', 'information_schema')
             AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'
           ORDER BY n.nspname, c.relname
         SQL
-        db.fetch(query).map { |row| "#{row[:nspname]}.#{row[:relname]}" }.sort
+        db.fetch(query).map { |row| { 
+          name: "#{row[:nspname]}.#{row[:relname]}", 
+          type: case row[:relkind]
+                when 'r', 'p' then :table
+                when 'v' then :view
+                when 'm' then :materialized_view
+                end
+        } }.sort_by { |obj| obj[:name] }.map { |obj| obj[:name] }
       rescue Sequel::DatabaseError => e
         print_warning("Could not query all schemas for tables: #{e.message}")
         []
@@ -229,11 +312,205 @@ Analyzing #{tables_to_analyze.length} table(s): #{tables_to_analyze.join(', ')}"
         end
         nil # Not found or ambiguous
       end
+      # Determine the type of database relation (table, view, materialized view) from its qualified name
+      def get_relation_type(db, qualified_name)
+        return :unknown unless db.database_type == :postgres
+
+        schema_name, rel_name = qualified_name.split(".", 2)
+        
+        query = <<~SQL
+          SELECT c.relkind
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = ? AND c.relname = ?
+        SQL
+        
+        result = db.fetch(query, schema_name, rel_name).first
+        
+        if result
+          case result[:relkind]
+          when 'r', 'p' then :table
+          when 'v' then :view
+          when 'm' then :materialized_view
+          else :unknown
+          end
+        else
+          # Try unqualified name in search path
+          query = <<~SQL
+            SELECT c.relkind
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = ?
+              AND n.nspname IN (SELECT unnest(current_schemas(false)))
+            LIMIT 1
+          SQL
+          
+          result = db.fetch(query, qualified_name).first
+          
+          if result
+            case result[:relkind]
+            when 'r', 'p' then :table
+            when 'v' then :view
+            when 'm' then :materialized_view
+            else :unknown
+            end
+          else
+            :unknown
+          end
+        end
+      rescue Sequel::DatabaseError => e
+        print_warning("Error determining relation type for #{qualified_name}: #{e.message}")
+        :unknown
+      end
+
+      # Fetch view definition (SQL query) for a view or materialized view
+      def fetch_view_definition(db, qualified_name)
+        return nil unless db.database_type == :postgres
+        
+        schema_name, view_name = qualified_name.include?('.') ? qualified_name.split('.', 2) : [nil, qualified_name]
+        
+        query = if schema_name
+          <<~SQL
+            SELECT pg_get_viewdef(
+              (SELECT c.oid FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = ? AND c.relname = ?
+               AND c.relkind IN ('v', 'm')),
+              true
+            ) AS definition
+          SQL
+        else
+          <<~SQL
+            SELECT pg_get_viewdef(
+              (SELECT c.oid FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE c.relname = ?
+               AND n.nspname IN (SELECT unnest(current_schemas(false)))
+               AND c.relkind IN ('v', 'm')
+               LIMIT 1),
+              true
+            ) AS definition
+          SQL
+        end
+        
+        result = schema_name ? db.fetch(query, schema_name, view_name).first : db.fetch(query, view_name).first
+        result ? result[:definition] : nil
+      rescue Sequel::DatabaseError => e
+        print_warning("Error fetching view definition for #{qualified_name}: #{e.message}")
+        nil
+      end
+      
+      # Fetch dependencies for a view (tables and other views it references)
+      def fetch_view_dependencies(db, qualified_name)
+        return [] unless db.database_type == :postgres
+        
+        schema_name, view_name = qualified_name.include?('.') ? qualified_name.split('.', 2) : [nil, view_name]
+        
+        query = if schema_name
+          <<~SQL
+            WITH RECURSIVE view_deps AS (
+              SELECT DISTINCT d.refobjid::regclass::text AS dependency
+              FROM pg_depend d
+              JOIN pg_rewrite r ON r.oid = d.objid
+              JOIN pg_class c ON c.oid = r.ev_class
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = ? AND c.relname = ?
+                AND d.refobjid != c.oid  -- Exclude self-references
+            )
+            SELECT dependency FROM view_deps
+            ORDER BY dependency
+          SQL
+        else
+          <<~SQL
+            WITH RECURSIVE view_deps AS (
+              SELECT DISTINCT d.refobjid::regclass::text AS dependency
+              FROM pg_depend d
+              JOIN pg_rewrite r ON r.oid = d.objid
+              JOIN pg_class c ON c.oid = r.ev_class
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE c.relname = ?
+                AND n.nspname IN (SELECT unnest(current_schemas(false)))
+                AND d.refobjid != c.oid  -- Exclude self-references
+              LIMIT 1
+            )
+            SELECT dependency FROM view_deps
+            ORDER BY dependency
+          SQL
+        end
+        
+        result = schema_name ? db.fetch(query, schema_name, view_name).all : db.fetch(query, view_name).all
+        result.map { |row| row[:dependency] }
+      rescue Sequel::DatabaseError => e
+        print_warning("Error fetching view dependencies for #{qualified_name}: #{e.message}")
+        []
+      end
+      
+      # Fetch materialized view specific information like refresh time
+      def fetch_materialized_view_info(db, qualified_name)
+        return nil unless db.database_type == :postgres
+        
+        schema_name, mv_name = qualified_name.include?('.') ? qualified_name.split('.', 2) : [nil, qualified_name]
+        
+        query = if schema_name
+          <<~SQL
+            SELECT 
+              c.relname,
+              CASE WHEN c.relkind = 'm' THEN true ELSE false END AS is_materialized,
+              s.last_refresh
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            LEFT JOIN (
+              SELECT schemaname, matviewname, 
+                     pg_catalog.pg_stat_get_last_analyze_time(c.oid) as last_refresh
+              FROM pg_matviews m
+              JOIN pg_class c ON c.relname = m.matviewname
+              JOIN pg_namespace n ON n.nspname = m.schemaname AND c.relnamespace = n.oid
+            ) s ON s.schemaname = n.nspname AND s.matviewname = c.relname
+            WHERE n.nspname = ? AND c.relname = ?
+              AND c.relkind = 'm'
+          SQL
+        else
+          <<~SQL
+            SELECT 
+              c.relname,
+              CASE WHEN c.relkind = 'm' THEN true ELSE false END AS is_materialized,
+              s.last_refresh
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            LEFT JOIN (
+              SELECT schemaname, matviewname, 
+                     pg_catalog.pg_stat_get_last_analyze_time(c.oid) as last_refresh
+              FROM pg_matviews m
+              JOIN pg_class c ON c.relname = m.matviewname
+              JOIN pg_namespace n ON n.nspname = m.schemaname AND c.relnamespace = n.oid
+            ) s ON s.schemaname = n.nspname AND s.matviewname = c.relname
+            WHERE c.relname = ?
+              AND n.nspname IN (SELECT unnest(current_schemas(false)))
+              AND c.relkind = 'm'
+            LIMIT 1
+          SQL
+        end
+        
+        result = schema_name ? db.fetch(query, schema_name, mv_name).first : db.fetch(query, mv_name).first
+        
+        if result
+          {
+            is_materialized: result[:is_materialized],
+            last_refresh: result[:last_refresh] ? Time.at(result[:last_refresh]) : nil
+          }
+        else
+          nil
+        end
+      rescue Sequel::DatabaseError => e
+        print_warning("Error fetching materialized view info for #{qualified_name}: #{e.message}")
+        nil
+      end
 
       # Export methods as module functions
       module_function :fetch_and_enhance_schema, :fetch_unique_single_columns, :initialize_column_stats,
                       :select_tables_to_analyze, :select_tables_for_analysis, :fetch_all_qualified_tables, :fetch_tables_in_search_path,
-                      :determine_default_tables, :resolve_user_requested_tables, :find_matching_table
+                      :determine_default_tables, :resolve_user_requested_tables, :find_matching_table, 
+                      :get_relation_type, :fetch_view_definition, :fetch_view_dependencies, :fetch_materialized_view_info
     end
   end
 end

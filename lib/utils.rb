@@ -1,121 +1,95 @@
-# frozen_string_literal: true
-
-require 'time'
-require 'uri'
-require 'bigdecimal'
-require 'sequel' # For Sequel::SQL::Blob
-
-# Optional dependencies
-begin
-  require 'colorize'
-  HAS_COLORIZE = true
-rescue LoadError
-  HAS_COLORIZE = false
-end
-
 module DbReport
   module Utils
-    # Helper method for colored console output
-    def colored_output(text, color = :default, mode = nil)
-      # Only colorize if the gem is available AND output is a TTY
-      return text unless HAS_COLORIZE && $stdout.tty?
+    require 'colorize'
+    require 'set'
+    require 'uri' # For database_name_present? helper
 
-      text = text.colorize(color)
-      text = text.send(mode) if mode
-      text
+    # Helper to print colored output
+    def colored_output(text, color, style = nil)
+      text.colorize(color: color, mode: style)
     end
 
-    # Abort script with a colored error message
-    def abort_with_error(message, error_code = 1)
-      abort colored_output("ERROR: #{message}", :red, :bold)
-    end
-
-    # Print a colored warning message
+    # Helper to print warning messages
     def print_warning(message)
       puts colored_output("Warning: #{message}", :yellow)
     end
 
-    # Print a colored info message
-    def print_info(message, color = :green, mode = nil)
-      puts colored_output(message, color, mode)
+    # Helper to print info messages
+    def print_info(message, color = :white, style = nil)
+      puts colored_output(message, color, style)
     end
 
-    # Print debug information if enabled
+    # Helper to print debug messages
     def print_debug(message)
-      # Assume $debug is available in the including context or passed
-      puts colored_output(message, :cyan) if $debug
+      puts colored_output("DEBUG: #{message}", :light_black) if $debug
     end
 
-    # Helper to parse table name into schema and table parts
-    def parse_table_identifier(table_name_string)
-      parts = table_name_string.to_s.split('.', 2)
+    # Helper to abort with an error message
+    def abort_with_error(message)
+      puts colored_output("Error: #{message}", :red, :bold)
+      exit(1)
+    end
+
+    # Parse table identifier string (schema.table or just table)
+    def parse_table_identifier(name_str)
+      parts = name_str.split('.', 2)
       if parts.length == 2
         { schema: parts[0].to_sym, table: parts[1].to_sym }
       else
-        # Default to nil schema if not qualified, table name as symbol
-        { schema: nil, table: parts[0].to_sym }
+        { table: parts[0].to_sym } # Assume public schema or search path
       end
     end
 
-    # Helper to create a Sequel identifier (handles qualified names)
-    def create_sequel_identifier(table_name_string)
-      parsed = parse_table_identifier(table_name_string)
+    # Create a Sequel identifier for a table name
+    def create_sequel_identifier(name_str)
+      parsed = parse_table_identifier(name_str)
       if parsed[:schema]
-        Sequel.qualify(parsed[:schema], parsed[:table])
+        Sequel[parsed[:schema]][parsed[:table]]
       else
-        Sequel.identifier(parsed[:table])
+        Sequel[parsed[:table]]
       end
     end
 
-    # Safely quote an identifier (less needed with Sequel datasets, but useful for raw SQL)
-    def quote_identifier(identifier, db_connection)
-      # Use Sequel's identifier quoting via the connection
-      db_connection.literal(Sequel.identifier(identifier))
+    # Quote identifier for raw SQL
+    def quote_identifier(db, identifier)
+      db.literal(identifier.to_sym)
     end
 
-    # Recursive helper to prepare data for JSON generation (handles non-serializable types)
-    def make_json_safe(obj)
-      case obj
-      when Hash then obj.transform_keys(&:to_s).transform_values { |v| make_json_safe(v) }
-      when Array then obj.map { |v| make_json_safe(v) }
-      when Time, Date then obj.iso8601 rescue obj.to_s # Use ISO 8601 for consistency
-      when Float then obj.nan? || obj.infinite? ? obj.to_s : obj # Handle NaN/Infinity
-      when BigDecimal then obj.to_s('F') # Standard notation for BigDecimal
-      when Sequel::SQL::Blob then '<Binary Data>' # Represent blobs safely
-      else obj
+    # Helper to make hash values JSON serializable (convert sets, symbols)
+    def make_json_safe(value)
+      case value
+      when Hash
+        value.transform_values { |v| make_json_safe(v) }
+      when Array
+        value.map { |v| make_json_safe(v) }
+      when Set
+        value.map { |v| make_json_safe(v) }
+      when Symbol
+        value.to_s
+      when Time # Convert Time objects to ISO 8601 string
+        value.iso8601
+      else
+        value
       end
     end
 
-    # Truncate long values for display
-    def truncate_value(value, max_length = 30)
-      return '' if value.nil?
-      str = value.to_s
-      # Handle multi-line strings by taking the first line
-      first_line = str.split("\n").first || ''
-      first_line.length > max_length ? "#{first_line[0...(max_length - 3)]}..." : first_line
+    # Helper to truncate long values for display
+    def truncate_value(value, max_length = 50)
+      str_value = value.to_s
+      if str_value.length > max_length
+        "#{str_value[0...max_length]}..."
+      else
+        str_value
+      end
     end
-
-    # Define constants used across modules/classes
-    DEFAULT_ENVIRONMENT = ENV.fetch('RAILS_ENV', 'development')
-    DEFAULT_POOL_SIZE = ENV.fetch('DB_POOL', 5).to_i # Sequel uses :max_connections
-    DEFAULT_CONNECT_TIMEOUT = 10 # Sequel uses :connect_timeout
-    DEFAULT_OUTPUT_FORMAT = 'compact'
-    CONFIG_FILE_PATH = File.join(Dir.pwd, 'config', 'database.yml').freeze
-    OUTPUT_FORMATS = %w[json summary gpt compact].freeze
-    SEQUEL_INTERNAL_TABLES = [
-      'schema_info',                 # Default table name for Sequel migrations (optional)
-      'sequel_migrations'            # Common alternative name
-    ].freeze
 
     # Helper to check if a config specifies a database name
-    # @param config [String, Hash, nil] The configuration object
-    # @return [Boolean] True if a database name is present, false otherwise
     def database_name_present?(config)
       case config
-      when String # URL
+      when String # URL string
         begin
           uri = URI.parse(config)
-          # Check if path is present and not just "/"
+          # Path exists and is longer than just "/"
           !uri.path.nil? && uri.path.length > 1
         rescue URI::InvalidURIError
           false # Invalid URL likely doesn't specify a DB
@@ -128,7 +102,93 @@ module DbReport
       end
     end
 
-    # Make it available as a class method too if needed elsewhere statically
-    module_function :database_name_present?
-  end
-end
+    # Define constants used across modules/classes
+    CONFIG_FILE_PATH = File.join(Dir.pwd, 'config', 'database.yml').freeze
+    OUTPUT_FORMATS = ['json', 'summary', 'gpt', 'compact'].freeze
+    DEFAULT_OUTPUT_FORMAT = 'compact'
+    DEFAULT_ENVIRONMENT = 'development'.freeze
+    DEFAULT_POOL_SIZE = 5.freeze
+    DEFAULT_CONNECT_TIMEOUT = 10.freeze
+    SEQUEL_INTERNAL_TABLES = Set['schema_migrations', 'ar_internal_metadata', 'sequel_migrations'].freeze
+    METADATA_KEYS = Set[:relation_type, :view_definition, :dependencies, :last_refresh, :is_materialized, :error].freeze
+
+    # Format stats for the summary output view
+    def format_stats_for_summary(stats)
+      formatted_stats = {}
+      type = stats[:type]&.to_sym rescue nil # Type from col_stats
+      is_json_type = type.to_s.include?('json') || (type.to_s.empty? && stats[:db_type].to_s.include?('json'))
+
+      # Common stats
+      formatted_stats[:min] = stats[:min] unless stats[:min].nil?
+      formatted_stats[:max] = stats[:max] unless stats[:max].nil?
+
+      # Type-specific stats
+      case type
+      when :string, :text, :xml, :blob, :enum, :inet
+        formatted_stats[:avg_length] = stats[:avg]&.round(1) if stats[:avg]
+      when :integer, :float, :decimal
+        formatted_stats[:average] = stats[:avg]&.round(2) if stats[:avg]
+      when :boolean
+        formatted_stats[:true_percentage] = stats[:true_percentage]&.round(1) if stats[:true_percentage]
+      when :array
+        formatted_stats[:avg_items] = stats[:avg]&.round(1) if stats[:avg] # Avg array items
+      when :json, :jsonb
+        formatted_stats[:avg_length] = stats[:avg]&.round(1) if stats[:avg] # Avg length of text representation
+      when :uuid
+        formatted_stats[:avg_length] = stats[:avg]&.round(1) if stats[:avg] # Avg length of text representation
+      end
+
+      # Fallback for JSON if type wasn't inferred correctly but db_type indicates it
+      if is_json_type && stats[:avg] && !formatted_stats.key?(:avg_length)
+        formatted_stats[:avg_length] = stats[:avg]&.round(1)
+      end
+
+      # Add frequency data (use raw data, format during printing)
+      formatted_stats[:most_frequent] = stats[:most_frequent] if stats[:most_frequent]&.any?
+      formatted_stats[:least_frequent] = stats[:least_frequent] if stats[:least_frequent]&.any?
+
+      # Add search value findings
+      if stats[:found] && stats[:search_value]
+        formatted_stats[:found] = true
+        formatted_stats[:search_value] = stats[:search_value]
+      end
+
+      formatted_stats
+    end
+
+    # Generate search summary data
+    def generate_search_summary(report_data)
+      meta = report_data[:metadata]
+      return nil unless meta[:search_value]
+
+      total_found = 0
+      found_locations = []
+
+      report_data[:tables].each do |table_name, table_data|
+        # Ensure table_data is a hash and contains some column stats
+        next unless table_data.is_a?(Hash) && table_data.values.any? { |v| v.is_a?(Hash) && v.key?(:count) }
+
+        # Iterate only over actual column stats, excluding metadata keys
+        column_data = table_data.reject { |k, _| METADATA_KEYS.include?(k) }
+        column_data.each do |column_name, stats|
+          if stats.is_a?(Hash) && stats[:found]
+            total_found += 1
+            found_locations << "#{table_name}.#{column_name}"
+          end
+        end
+      end
+
+      {
+        search_value: meta[:search_value],
+        total_found: total_found,
+        found_locations: found_locations
+      }
+    end
+
+    # Make methods available as class methods too
+    module_function :database_name_present?, :format_stats_for_summary, :generate_search_summary,
+                    :colored_output, :abort_with_error, :print_warning, :print_info, :print_debug,
+                    :parse_table_identifier, :create_sequel_identifier, :quote_identifier,
+                    :make_json_safe, :truncate_value
+  end # Closes module Utils
+end # Closes module DbReport

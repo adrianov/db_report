@@ -11,12 +11,22 @@ module DbReport
       extend Utils  # Extend Utils to make its methods available as module methods too
 
       # Batch analyze frequencies for multiple columns at once
-      def batch_analyze_frequencies(col_stats_map, base_dataset, columns_schema, unique_single_columns)
+      def batch_analyze_frequencies(col_stats_map, base_dataset, columns_schema, unique_single_columns, relation_type = :table)
         return if columns_schema.empty?
 
         # Get total row count from first column's stats
         row_count = col_stats_map.values.first[:count].to_i
         return if row_count <= 0
+        
+        # Handle view-specific optimizations
+        if relation_type == :view || relation_type == :materialized_view
+          print_debug("  Analyzing frequencies for #{relation_type}, performance optimizations engaged") if $debug
+          row_limit = determine_view_sample_size(row_count, relation_type)
+          if row_limit < row_count
+            print_debug("  Using row sampling (limit: #{row_limit}) for view frequency analysis") if $debug
+            base_dataset = base_dataset.limit(row_limit)
+          end
+        end
 
         # Identify columns needing frequency analysis and group by type
         analyzable_columns = {}
@@ -44,19 +54,20 @@ module DbReport
             end
           end
         end
-
         # Process each type group separately for UNION compatibility
         analyzable_columns.each do |type_key, columns|
           print_debug("  Processing batch for type: #{type_key} with #{columns.size} columns") if $debug
+          
+          # Add extra safety for views - try/catch the entire batch processing
+          begin
+            # Most frequent values
+            batch_analyze_most_frequent_by_type(columns, base_dataset)
 
-          # Most frequent values
-          batch_analyze_most_frequent_by_type(columns, base_dataset)
-
-          # Least frequent values where needed
-          least_freq_columns = columns.select do |col_info|
-            distinct_count = col_info[:col_stats][:distinct_count] || 0
-            distinct_count > 5
-          end
+            # Least frequent values where needed
+            least_freq_columns = columns.select do |col_info|
+              distinct_count = col_info[:col_stats][:distinct_count] || 0
+              distinct_count > 5
+            end
 
           batch_analyze_least_frequent_by_type(least_freq_columns, base_dataset) if least_freq_columns.any?
 
@@ -69,8 +80,18 @@ module DbReport
           end
 
           batch_analyze_all_values_by_type(few_distinct_columns, base_dataset) if few_distinct_columns.any?
+          
+          # For views, add extra error handling with helpful context
+          rescue => e
+            if relation_type == :view || relation_type == :materialized_view
+              puts colored_output("  Error in frequency analysis for #{relation_type} (type: #{type_key}): #{e.message}", :red)
+              print_debug("  This may be due to the complexity of the view definition or resource limitations.") if $debug
+              print_debug("  Consider analyzing a subset of columns or using a different approach.") if $debug
+            else
+              puts colored_output("  Error in frequency analysis (type: #{type_key}): #{e.message}", :red)
+            end
+          end
         end
-
         # Clean up least_frequent that don't need it
         columns_schema.each do |column_sym, _|
           col_stats = col_stats_map[column_sym]
@@ -80,15 +101,25 @@ module DbReport
           end
         end
       end
-
       # Determine if a column needs frequency analysis
-      def needs_frequency_analysis?(col_stats, column_sym, column_type, unique_single_columns, row_count)
+      def needs_frequency_analysis?(col_stats, column_sym, column_type, unique_single_columns, row_count, relation_type = :table)
         return false if row_count <= 0 # Skip if table is empty
 
         is_groupable = !%i[text blob xml array hstore json jsonb].include?(column_type)
         is_likely_key = col_stats[:is_unique] || unique_single_columns.include?(column_sym) ||
                          column_sym == :id || column_sym.to_s.end_with?('_id')
         is_json_type = column_type == :json || column_type == :jsonb
+        
+        # For materialized views, be more selective about analyzed columns
+        if relation_type == :materialized_view
+          # Skip additional columns that might be more computational in materialized views
+          if column_sym.to_s.start_with?('calculated_') || 
+             column_sym.to_s.include?('_count') || 
+             column_sym.to_s.include?('_sum')
+            print_debug("    Skipping potential computed column in materialized view: #{column_sym}") if $debug
+            return false
+          end
+        end
 
         # Skip if not groupable (unless JSON) or is a likely key (unless JSON)
         return false unless is_groupable || is_json_type
@@ -162,13 +193,19 @@ module DbReport
         begin
           result = freq_dataset.all
         rescue Sequel::DatabaseError => e
-          puts colored_output("  SQL Frequency Error: #{e.message.lines.first.strip}", :red)
+          error_message = e.message.lines.first.strip
+          # Detect specific view/materialized view errors
+          if error_message.include?('materialized view') || error_message.include?('view')
+            puts colored_output("  View-specific SQL error: #{error_message}. This is common with complex views.", :red)
+            print_debug("  Consider modifying the view definition or using a simpler query approach") if $debug
+          else
+            puts colored_output("  SQL Frequency Error: #{error_message}", :red)
+          end
           print_debug "  Failed SQL: #{sql_query}" if $debug
           return [] # Return empty array on SQL error
         rescue StandardError => e
           puts colored_output("  Error (Frequency Query): #{e.message.lines.first.strip}", :red)
           return []
-        ensure
           duration = (Time.now - start_time).round(4)
           print_debug("  Frequency Duration: #{duration}s") if $debug
         end
@@ -345,12 +382,10 @@ module DbReport
           print_debug("  Batch all values analysis duration: #{duration}s") if $debug
         end
       end
-
       # Analyze frequency of column values
-      def analyze_frequency(col_stats, column_sym, base_dataset, column_type, unique_single_columns)
+      def analyze_frequency(col_stats, column_sym, base_dataset, column_type, unique_single_columns, relation_type = :table)
         is_groupable = !%i[text blob xml array hstore json jsonb].include?(column_type)
-        is_likely_key = col_stats[:is_unique] || unique_single_columns.include?(column_sym) || column_sym == :id || column_sym.to_s.end_with?('_id')
-        is_json_type = column_type == :json || column_type == :jsonb
+        is_likely_key = col_stats[:is_unique] || unique_single_columns.include?(column_sym) || column_sym == :id ||
 
         # Skip if not groupable (unless JSON) or is a likely key (unless JSON)
         unless is_groupable || is_json_type
@@ -378,12 +413,62 @@ module DbReport
           puts e.backtrace.join("\n") if $debug
         end
       end
+      
+      # Determine appropriate sample size for view frequency analysis
+      # This helps optimize performance for large or complex views
+      def determine_view_sample_size(total_rows, relation_type)
+        if relation_type == :materialized_view
+          # Materialized views can handle larger samples since they're pre-computed
+          if total_rows > 1_000_000
+            10_000  # 10k sample for very large materialized views
+          elsif total_rows > 100_000
+            5_000   # 5k sample for large materialized views
+          elsif total_rows > 10_000
+            2_000   # 2k sample for medium materialized views
+          else
+            total_rows  # Full analysis for smaller materialized views
+          end
+        else  # Regular view
+          # Regular views may execute the underlying query each time, so be more conservative
+          if total_rows > 100_000
+            2_000   # 2k sample for large views
+          elsif total_rows > 10_000
+            1_000   # 1k sample for medium views
+          elsif total_rows > 1_000
+            500     # 500 row sample for smaller views
+          else
+            total_rows  # Full analysis for very small views
+          end
+        end
+      end
+      
+      # Check if a view is safe for frequency analysis (avoid intensive operations on complex views)
+      def is_view_safe_for_frequency(view_definition, row_count)
+        return true if row_count < 1000  # Small views are generally safe
+        
+        # Check for potential complex operations in view definition
+        complex_operations = [
+          'WITH RECURSIVE', 'LATERAL', 'WINDOW',
+          'ROW_NUMBER()', 'RANK()', 'DENSE_RANK()',
+          'PARTITION BY', 'COUNT(*) FILTER', 'ARRAY_AGG'
+        ]
+        
+        # Lower risk if view definition doesn't contain complex operations
+        if view_definition && complex_operations.none? { |op| view_definition.include?(op) }
+          true
+        else
+          # For complex views, we'll still analyze but with more cautious sampling
+          print_debug("  View contains complex operations, using more conservative analysis") if $debug
+          true  # Still analyze but sampling will be more conservative
+        end
+      end
 
       # Make module methods available as instance methods
       module_function :batch_analyze_frequencies, :needs_frequency_analysis?, :analyze_json_frequency,
                       :analyze_standard_frequency, :format_frequency_results, :execute_frequency_query,
                       :batch_analyze_most_frequent_by_type, :batch_analyze_least_frequent_by_type,
-                      :batch_analyze_all_values_by_type, :analyze_frequency
-    end
-  end
-end
+                      :batch_analyze_all_values_by_type, :analyze_frequency, :determine_view_sample_size,
+                      :is_view_safe_for_frequency
+    end # Closes FrequencyAnalyzer
+  end # Closes DbAnalyzer
+end # Closes DbReport

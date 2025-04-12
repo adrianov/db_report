@@ -80,21 +80,25 @@ Table: #{table_name}", :cyan, :bold)
         if table_data.is_a?(Hash) && table_data[:error]
           puts colored_output("Table: #{table_name} - Error: #{table_data[:error]}", :red)
           next
+          next
         end
 
-        unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
-           puts colored_output("Table: #{table_name} - Skipping malformed data", :yellow)
-           next
+        # Check if there's any valid column data, ignoring metadata keys
+        unless table_data.is_a?(Hash) && table_data.values.any? { |v| v.is_a?(Hash) && v.key?(:count) }
+          puts colored_output("Table: #{table_name} - Skipping malformed data (no valid column stats found)", :yellow)
+          next
         end
 
-        column_count = table_data.keys.length
-        # Safely access count from the first column's stats hash
-        first_col_stats = table_data.values.first || {}
+        # Filter out metadata keys before counting columns and getting row count
+        column_data = table_data.reject { |k, _| DbReport::Utils::METADATA_KEYS.include?(k) }
+        column_count = column_data.keys.length
+        # Safely access count from the first *actual* column's stats hash
+        first_col_stats = column_data.values.first || {}
         row_count = first_col_stats[:count] || 'N/A' # Access :count symbol
         puts colored_output("  Rows: #{row_count}, Columns: #{column_count}", :white)
 
-        table_data.each do |column_name, stats|
-          next unless stats.is_a?(Hash) # Ensure stats is a hash
+        # Iterate only over actual column data
+        column_data.each do |column_name, stats|
 
           unique_marker = stats[:is_unique] ? colored_output(' (unique)', :light_blue) : ''
           found_marker = stats[:found] ? colored_output(' [FOUND]', :green, :bold) : ''
@@ -190,22 +194,26 @@ Table: #{table_name}", :cyan, :bold)
         if table_data.is_a?(Hash) && table_data[:error]
           puts "  - Error: #{table_data[:error]}"
           next
-        end
-
-        unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
-          puts "  - Skipping malformed data for table: #{table_name}"
           next
         end
 
-        column_count = table_data.keys.length
-        first_col_stats = table_data.values.first || {}
+        # Check if there's any valid column data, ignoring metadata keys
+        unless table_data.is_a?(Hash) && table_data.values.any? { |v| v.is_a?(Hash) && v.key?(:count) }
+          puts "  - Skipping malformed data for table (no valid column stats found): #{table_name}"
+          next
+        end
+
+        # Filter out metadata keys before counting columns and getting row count
+        column_data = table_data.reject { |k, _| DbReport::Utils::METADATA_KEYS.include?(k) }
+        column_count = column_data.keys.length
+        first_col_stats = column_data.values.first || {}
         row_count = first_col_stats[:count] || 'N/A'
         puts "\n- **Rows:** #{row_count}"
         puts "- **Columns:** #{column_count}"
-        puts
         puts "### Columns Details:"
 
-        table_data.each do |column_name, stats|
+        # Iterate only over actual column data
+        column_data.each do |column_name, stats|
           next unless stats.is_a?(Hash)
 
           type_part = stats[:type].to_s
@@ -351,19 +359,23 @@ Table: #{table_name}", :cyan, :bold)
           next
         end
 
-        unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
-            puts colored_output("Table: #{table_name} - Skipping malformed data", :yellow)
-            next
+        # Check if there's any valid column data, ignoring metadata keys
+        unless table_data.is_a?(Hash) && table_data.values.any? { |v| v.is_a?(Hash) && v.key?(:count) }
+          puts colored_output("Table: #{table_name} - Skipping malformed data (no valid column stats found)", :yellow)
+          next
         end
 
-        first_col_stats = table_data.values.first || {}
+        # Filter out metadata keys before getting row count
+        column_data = table_data.reject { |k, _| DbReport::Utils::METADATA_KEYS.include?(k) }
+        first_col_stats = column_data.values.first || {}
         row_count = first_col_stats[:count] || 'N/A'
 
         # Prepare data before creating the table
         all_rows_data = []
         initial_headers = ['Column', 'Type', 'Nulls (%)', 'Distinct', 'Stats', 'Found']
 
-        table_data.each do |column_name, stats|
+        # Iterate only over actual column data
+        column_data.each do |column_name, stats|
           next unless stats.is_a?(Hash)
 
           type_str = stats[:db_type].to_s
@@ -487,10 +499,7 @@ Table: #{table_name}", :cyan, :bold)
     end
 
     def write_json(output_file)
-      # Use make_json_safe from Utils module
-      report_for_json = make_json_safe(report_data)
-
-      # Add search summary to JSON if search value was provided
+      # Add search summary directly to report_data if needed
       meta = report_data[:metadata]
       if meta[:search_value]
         search_summary = {
@@ -498,21 +507,24 @@ Table: #{table_name}", :cyan, :bold)
           total_found: 0,
           found_locations: []
         }
-
         report_data[:tables].each do |table_name, table_data|
-          next unless table_data.is_a?(Hash) && table_data.values.first.is_a?(Hash)
-
-          table_data.each do |column_name, stats|
-            if stats[:found] && stats[:search_value]
+          # Ensure table_data is a hash and contains some column stats
+          next unless table_data.is_a?(Hash) && table_data.values.any? { |v| v.is_a?(Hash) && v.key?(:count) }
+          column_data = table_data.reject { |k, _| DbReport::Utils::METADATA_KEYS.include?(k) }
+          column_data.each do |column_name, stats|
+            # Only add to search summary if the value was actually found in this column
+            if stats[:found]
               search_summary[:total_found] += 1
               search_summary[:found_locations] << "#{table_name}.#{column_name}"
             end
           end
-        end
+        end # Closes report_data[:tables].each loop
+        # Add search_summary directly to the original report data
+        report_data[:search_summary] = search_summary
+      end # Closes if meta[:search_value]
 
-        # Add search_summary to the report data
-        report_for_json["search_summary"] = search_summary
-      end
+      # Now create the JSON-safe version *after* potential modification
+      report_for_json = make_json_safe(report_data)
 
       # Use a default output file if none provided
       output_file ||= File.join(Dir.pwd, "db_report_#{Time.now.strftime('%Y%m%d_%H%M%S')}.json")
@@ -528,5 +540,5 @@ Table: #{table_name}", :cyan, :bold)
 
       puts colored_output("Report written to #{output_file}", :green)
     end
-  end
-end
+  end # Closes class Reporter
+end # Closes module DbReport
